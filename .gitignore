@@ -1,0 +1,30 @@
+# ============================================================
+# Git ignore rules for the Ultrasound Battery Lab project
+# ============================================================
+
+# --- Credentials (NEVER commit) ---------------------------------
+.env
+
+# --- Python bytecode --------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Virtual environment ----------------------------------------
+.venv/
+venv/
+env/
+
+# --- Scan output data -------------------------------------------
+# All generated data lives under data/ — these can be large (GB+)
+# and should be archived separately, not stored in git.
+data/
+
+# --- OS / editor noise ------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- Claude Code agent skills (unrelated to project) ------------
+skills/
+.claude/
