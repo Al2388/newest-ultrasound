@@ -10,10 +10,10 @@ Coordinate system
 -----------------
   X axis — fast scan axis (left ↔ right during each scan line)
   Y axis — slow axis (advances by one pitch between scan lines)
-  Z axis — transducer height above the battery surface (set once before scan)
+  Z axis — fixed by the gantry; not commanded from software in this project.
 
-All positional moves use absolute coordinates (G90). The origin (0, 0, 0) is
-defined at the start of each scan session by G92 X0 Y0 Z0.
+All positional moves use absolute coordinates (G90). The XY origin is defined
+at the start of each scan session by G92 X0 Y0.
 
 Communication
 -------------
@@ -50,9 +50,9 @@ class PrecisionEnder:
         MCU on connection; this delay lets Marlin finish booting before sending
         any G-code commands.
     reset_origin : bool
-        If True, send G92 X0 Y0 Z0 to define the current position as the scan
-        origin. Set False when re-connecting mid-session (e.g. for jog-only use
-        or return-to-start) so the existing coordinate system is preserved.
+        If True, send G92 X0 Y0 to define the current XY position as the scan
+        origin. Set False when re-connecting mid-session so the existing
+        coordinate system is preserved.
     """
 
     def __init__(self, port: str, baud: int = 115200,
@@ -75,6 +75,9 @@ class PrecisionEnder:
         self.scan_feedrate        = int(self.scan_speed_mm_s * 60)   # G1 F in mm/min
         self.positioning_feedrate = 1800    # mm/min for rapid between-line moves
         self.line_spacing_mm      = 0.1
+
+        # Tracked current XY position in scan coordinates (mm).
+        # Z is not software-controlled (gantry has no Z stage in this build).
         self.current_x            = 0.0
         self.current_y            = 0.0
 
@@ -155,7 +158,7 @@ class PrecisionEnder:
                     print(f"[PRINTER] Marlin error: {resp}")
             except queue.Empty:
                 continue
-        return "timeout"
+        raise TimeoutError(f"Timed out waiting for printer ok after: {command.strip()}")
 
     def send_command(self, command: str):
         """
@@ -177,16 +180,16 @@ class PrecisionEnder:
         """
         Send startup G-code to configure Marlin for scan use.
 
-        G90        — absolute positioning (all X/Y/Z moves reference the origin)
-        M83        — relative extrusion mode (extruder motor is unused)
+        G90        — absolute positioning (all X/Y moves reference the origin)
+        M83        — relative extrusion mode (extruder unused; safe to set)
         M211 S0    — disable software endstops so the probe can reach all edges
         G21        — metric (mm) units
-        M92        — steps/mm: X80 Y80 Z400 matches Ender GT2 belt + 8× microstep
+        M92        — steps/mm: X80 Y80 matches Ender GT2 belt + 8× microstep
         M203        — max velocity limits (mm/s) to protect the belt and mechanics
         M204        — acceleration limits (mm/s²) for print, retract, travel
         M205        — jerk / junction deviation to smooth direction changes
-        G92        — if reset_origin, define current position as (0, 0, 0)
-        M503        — echo EEPROM settings to the serial console for logging
+        G92        — if reset_origin, define current XY position as (0, 0)
+        M503        — echo current EEPROM settings to the serial console
         """
         print(f"[PRINTER] Initializing  (reset_origin={reset_origin}) ...")
 
@@ -195,16 +198,16 @@ class PrecisionEnder:
             "M83",                       # relative extrusion (unused, safe to set)
             "M211 S0",                   # disable software endstops
             "G21",                       # millimetre units
-            "M92 X80 Y80 Z400",          # steps/mm calibration
-            "M203 X500 Y500 Z10 E50",    # max velocity (mm/s)
+            "M92 X80 Y80",               # steps/mm calibration (XY only)
+            "M203 X500 Y500 E50",        # max velocity (mm/s)
             "M204 P500 R500 T500",       # acceleration (mm/s²): print / retract / travel
-            "M205 X5.0 Y5.0 Z0.4 E5.0", # junction deviation / jerk (mm/s)
+            "M205 X5.0 Y5.0 E5.0",       # junction deviation / jerk (mm/s)
         ]
 
-        # G92 redefines the current position as the coordinate origin.
-        # Only do this at the very start of a fresh scan — not during jog or return.
+        # G92 redefines the current XY position as the coordinate origin.
+        # Only do this at the very start of a fresh scan — not during return.
         if reset_origin:
-            commands.append("G92 X0 Y0 Z0")
+            commands.append("G92 X0 Y0")
 
         commands.append("M503")   # request EEPROM echo for the log
 
@@ -220,28 +223,19 @@ class PrecisionEnder:
 
     def move_to_position(self, x: float, y: float, fast: bool = True):
         """
-        Absolute move to (x, y) in mm.
+        Absolute XY move to (x, y) in mm.
 
         Parameters
         ----------
         x, y : float  Target coordinates in the scan coordinate system (mm).
         fast : bool
-            True  — positioning feedrate (rapid between-line repositioning).
+            True  — positioning feedrate (rapid, between-line repositioning).
             False — scan feedrate (slower, for pre-scan transducer alignment).
         """
         f = self.positioning_feedrate if fast else self.scan_feedrate
         self.send_command(f"G1 X{x:.3f} Y{y:.3f} F{f}")
         self.current_x = x
         self.current_y = y
-
-    def move_z(self, z_mm: float, speed: int = 600):
-        """
-        Absolute Z move to z_mm at speed mm/min.
-
-        Use this to adjust the water-coupling gap between the transducer face
-        and the battery surface. Typical range: 1–10 mm.
-        """
-        self.send_command(f"G1 Z{z_mm:.3f} F{speed}")
 
     def wait_for_completion(self, timeout: float = 30.0):
         """
@@ -275,7 +269,7 @@ class PrecisionEnder:
 
 
 # =============================================================================
-# Convenience factory used by CScanService and the jog/return handlers
+# Convenience factory used by CScanService
 # =============================================================================
 
 def setup_precision_printer(port: str, baud: int,
@@ -294,7 +288,7 @@ def setup_precision_printer(port: str, baud: int,
     port, baud      : serial connection parameters
     roi_w, roi_h    : region-of-interest width and height in mm
     safety_margin   : mm to shrink from each edge (default 2 mm on every side)
-    reset_origin    : if True, define current position as scan origin (G92)
+    reset_origin    : if True, define current XY position as scan origin (G92)
 
     Returns
     -------

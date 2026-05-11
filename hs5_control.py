@@ -85,16 +85,16 @@ def envelope_hilbert(x: np.ndarray) -> np.ndarray:
     if n == 0:
         return x
 
-    X = np.fft.rfft(x)
-    H = np.zeros_like(X)
+    X = np.fft.fft(x)
+    H = np.zeros(n, dtype=np.float32)
 
     # One-sided weighting: double positive-frequency bins, keep DC and Nyquist at ×1
     if n % 2 == 0:
-        H[0] = 1.0; H[1:-1] = 2.0; H[-1] = 1.0
+        H[0] = 1.0; H[1:n // 2] = 2.0; H[n // 2] = 1.0
     else:
-        H[0] = 1.0; H[1:] = 2.0
+        H[0] = 1.0; H[1:(n + 1) // 2] = 2.0
 
-    return np.abs(np.fft.irfft(X * H, n=n)).astype(np.float32, copy=False)
+    return np.abs(np.fft.ifft(X * H)).astype(np.float32, copy=False)
 
 
 # =============================================================================
@@ -157,10 +157,11 @@ class HS5StreamPeaks:
         self.fs  = float(fs_hz)
         self.dt  = 1.0 / self.fs
         self.win_us = float(win_us)
+        self.gate_us = (float(gate_us[0]), float(gate_us[1]))
 
         # Gate boundaries: convert µs → integer sample indices
-        self.g0       = max(0, int(round(gate_us[0] * 1e-6 * self.fs)))
-        self.g1       = max(self.g0 + 1, int(round(gate_us[1] * 1e-6 * self.fs)))
+        self.g0       = max(0, int(round(self.gate_us[0] * 1e-6 * self.fs)))
+        self.g1       = max(self.g0 + 1, int(round(self.gate_us[1] * 1e-6 * self.fs)))
         self.gate_len = self.g1 - self.g0   # number of samples in the analysis gate
 
         # Minimum HS5 record length: 0.5 ms worth of samples, at least 10 000
@@ -290,8 +291,8 @@ class HS5StreamPeaks:
         ch2.coupling = libtiepie.CK_DCV
 
         # Recompute gate sample indices at the actual (hardware-clamped) sample rate
-        self.g0       = max(0, int(round(self.g0 * self.fs / float(self.fs))))
-        self.g1       = max(self.g0 + 1, self.g1)
+        self.g0       = max(0, int(round(self.gate_us[0] * 1e-6 * self.fs)))
+        self.g1       = max(self.g0 + 1, int(round(self.gate_us[1] * 1e-6 * self.fs)))
         self.gate_len = self.g1 - self.g0
 
         print(f"[HS5] Opened.  fs={self.fs/1e6:.1f} MHz  "
@@ -378,7 +379,8 @@ class HS5StreamPeaks:
 
     def acquire_peaks(self,
                       duration_s: float = 1.0,
-                      save_waveforms: bool = True
+                      save_waveforms: bool = True,
+                      save_full_waveforms: bool = False
                       ) -> tuple:
         """
         Collect pulse features continuously for `duration_s` seconds.
@@ -397,6 +399,9 @@ class HS5StreamPeaks:
             If True, the raw float32 gate window is stored for every pulse and
             returned as a 2-D array. Set False to reduce memory usage for fast
             C-scan lines where only features are needed.
+        save_full_waveforms : bool
+            If True, also return a 2-D array of full post-sync windows from
+            0 to win_us. This is intended for live display / gate visualisation.
 
         Returns
         -------
@@ -420,6 +425,7 @@ class HS5StreamPeaks:
         thr  = float(self.ch2_hi)       # rising-edge detection threshold (V)
         refr = int(self.refractory_samp)
         g0, g1 = self.g0, self.g1
+        full_len = max(g1, int(round(self.win_us * 1e-6 * self.fs)))
         t0     = time.perf_counter()
 
         cum_abs       = 0       # cumulative sample count across all blocks received
@@ -433,6 +439,7 @@ class HS5StreamPeaks:
 
         p_amp, p_tof, p_eng, p_tt = [], [], [], []
         p_wf = [] if save_waveforms else None
+        p_full = [] if save_full_waveforms else None
 
         try:
             while (time.perf_counter() - t0) < duration_s:
@@ -473,8 +480,9 @@ class HS5StreamPeaks:
                         continue
 
                     s0, s1 = e + g0, e + g1
+                    f1 = e + full_len
                     # Skip if the gate extends beyond the current combined buffer
-                    if s1 > c1.size:
+                    if s1 > c1.size or (save_full_waveforms and f1 > c1.size):
                         continue
 
                     gate_slice       = c1[s0:s1].copy()
@@ -485,10 +493,13 @@ class HS5StreamPeaks:
                     p_tt.append(t0 + e_abs / self.fs)
                     if save_waveforms:
                         p_wf.append(gate_slice)
+                    if save_full_waveforms:
+                        p_full.append(c1[e:f1].copy())
                     last_edge_abs = e_abs
 
-                # Keep the last g1 samples as the carry for the next hardware block
-                rem       = min(g1, c1.size)
+                # Keep enough samples as carry for gates/full display windows
+                # that straddle the next hardware block.
+                rem       = min(full_len if save_full_waveforms else g1, c1.size)
                 carry_ch1 = c1[-rem:]
                 carry_ch2 = c2[-rem:]
 
@@ -499,7 +510,8 @@ class HS5StreamPeaks:
         # Return empty arrays if no pulses were detected in this window
         if not p_tt:
             empty = np.array([], dtype=np.float32)
-            return np.array([], dtype=np.float64), empty, empty, empty, None
+            result = (np.array([], dtype=np.float64), empty, empty, empty, None)
+            return (*result, None) if save_full_waveforms else result
 
         # Sort by wall-clock timestamp (almost always already sorted, but guard anyway)
         idx = np.argsort(p_tt)
@@ -508,5 +520,8 @@ class HS5StreamPeaks:
         tf  = np.array(p_tof, dtype=np.float32)[idx]
         ee  = np.array(p_eng, dtype=np.float32)[idx]
         wf  = np.stack(p_wf, axis=0)[idx] if save_waveforms else None
+        full_wf = np.stack(p_full, axis=0)[idx] if save_full_waveforms else None
 
+        if save_full_waveforms:
+            return tt, aa, tf, ee, wf, full_wf
         return tt, aa, tf, ee, wf

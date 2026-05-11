@@ -42,6 +42,7 @@ self._stop_event (threading.Event).
 import json
 import math
 import os
+import re
 import time
 import threading
 import traceback
@@ -240,6 +241,25 @@ def align_row_minblur(row: np.ndarray, ref: np.ndarray,
     return row_out.astype(np.float32), shift_use
 
 
+def apply_fractional_shift(row: np.ndarray, shift: float) -> np.ndarray:
+    """Apply a sub-pixel lateral shift using the same FFT phase-ramp method."""
+    n = len(row)
+    if n == 0 or abs(shift) < 1e-12:
+        return row.astype(np.float32, copy=False)
+    k = np.fft.rfftfreq(n)
+    shifted = np.fft.irfft(
+        np.fft.rfft(np.nan_to_num(row, nan=0.0)) * np.exp(-2j * np.pi * k * shift),
+        n=n,
+    )
+    return shifted.astype(np.float32)
+
+
+def _safe_session_name(name: str, fallback: str) -> str:
+    """Return a filesystem-safe run label for a scan/session folder."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "").strip()).strip("._-")
+    return safe or fallback
+
+
 # =============================================================================
 # Service class
 # =============================================================================
@@ -276,10 +296,14 @@ class CScanService:
             "pitch":          0.1,           # line spacing (mm) — nlines = roi_h / pitch
             "speed":          10.0,          # scan speed (mm/s)
             "cols":           500,           # output image width in pixels
+            "scan_name":      "",            # label for the run folder
+            "base_out_dir":   "data/cscan",  # parent directory for run folders
             "out_dir":        "data/cscan",  # output directory (relative to CWD)
             "cmap":           "turbo",       # matplotlib colormap for PNG exports
             "save_waveforms": True,          # False → skip raw waveform archive
         }
+        self._session_id = None
+        self._session_dir = None
         self.cloud = CloudManager()
 
     # -------------------------------------------------------------------------
@@ -293,6 +317,8 @@ class CScanService:
                 "status":   self.status,
                 "progress": dict(self.progress),
                 "images":   dict(self.images),
+                "session_id": self._session_id,
+                "folder": self._session_dir,
             }
 
     def _set(self, status=None, progress=None, images=None):
@@ -301,6 +327,26 @@ class CScanService:
             if status   is not None: self.status = status
             if progress is not None: self.progress.update(progress)
             if images   is not None: self.images.update(images)
+
+    def _write_session_manifest(self, state: str):
+        """Write a human-readable manifest into the current run folder."""
+        if not self._session_dir:
+            return
+        manifest = {
+            "mode": "cscan",
+            "state": state,
+            "session_id": self._session_id,
+            "session_dir": self._session_dir,
+            "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+            "progress": dict(self.progress),
+            "images": dict(self.images),
+            "config": dict(self.config),
+        }
+        try:
+            with open(os.path.join(self._session_dir, "session_manifest.json"), "w") as f:
+                json.dump(manifest, f, indent=2)
+        except Exception as e:
+            print(f"[DATA] Manifest write error: {e}")
 
     # -------------------------------------------------------------------------
     # Control API (called from FastAPI handlers)
@@ -317,17 +363,33 @@ class CScanService:
             return False, "Already Running"
         if new_config:
             self.config.update(new_config)
+
+        ts = int(time.time())
+        name = _safe_session_name(self.config.get("scan_name", ""), "scan")
+        stem = f"cscan_{name}_{ts}"
+        base_out = self.config.get("base_out_dir", "data/cscan")
+        out_dir = os.path.join(base_out, stem)
+        os.makedirs(out_dir, exist_ok=True)
+        self.config["out_dir"] = out_dir
+        self._session_id = stem
+        self._session_dir = out_dir
+
         self._stop_event.clear()
         self.running = True
-        self._set(status="RUNNING")
+        self._set(
+            status="RUNNING",
+            progress={"msg": f"Started {stem}", "session_id": stem},
+            images={"Amplitude": None, "ToF": None, "Energy": None},
+        )
+        self._write_session_manifest("starting")
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-        return True, "Started"
+        return True, f"Started: {stem}"
 
     def stop_scan(self) -> bool:
         """
         Request an early stop. The worker checks _stop_event after each line
-        and exits cleanly without saving the final NPZ.
+        then returns to the origin and saves the partial feature maps.
         """
         if self.running:
             self._stop_event.set()
@@ -356,31 +418,6 @@ class CScanService:
             return True, "Returned"
         except Exception as e:
             self._set(status="ERROR")
-            return False, str(e)
-
-    def jog_z_axis(self, z_distance: float) -> tuple[bool, str]:
-        """
-        Move the Z axis by z_distance mm relative to current position.
-
-        Used to adjust the water-coupling gap between the transducer face and
-        the battery surface. The G91/G90 switch ensures only this single move
-        is relative; all subsequent moves remain absolute.
-        """
-        if self.running:
-            return False, "Cannot move Z while scanning."
-        try:
-            pr, _, _, _, _ = setup_precision_printer(
-                self.config["com_port"], 115200,
-                self.config["roi_w"], self.config["roi_h"],
-                reset_origin=False,
-            )
-            pr.send_command("G91")                              # relative mode
-            pr.send_command(f"G1 Z{z_distance:.3f} F300")
-            pr.wait_for_completion()
-            pr.send_command("G90")                              # back to absolute
-            pr.close()
-            return True, f"Moved Z by {z_distance:.3f} mm"
-        except Exception as e:
             return False, str(e)
 
     # -------------------------------------------------------------------------
@@ -481,6 +518,9 @@ class CScanService:
 
         meta = {
             "scan_id":           f"scan_{ts}",
+            "session_id":        self._session_id,
+            "scan_name":         cfg.get("scan_name", ""),
+            "session_dir":       cfg["out_dir"],
             "timestamp_iso":     datetime.now(timezone.utc).isoformat(),
             "instrument":        "TiePie HS5",
             "fs_hz":             hs_info.get("fs_hz", 20_000_000),
@@ -488,6 +528,7 @@ class CScanService:
             "gate_us":           hs_info.get("gate_us"),
             "gate_samples":      hs_info.get("gate_samples"),
             "sync_thresholds_v": hs_info.get("sync_thresholds_v"),
+            "partial":           bool(hs_info.get("partial", False)),
             "roi_w_mm":          cfg["roi_w"],
             "roi_h_mm":          cfg["roi_h"],
             "pitch_mm":          cfg["pitch"],
@@ -500,6 +541,7 @@ class CScanService:
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
+        self._write_session_manifest("saved")
 
         print(f"[DATA] Saved: {npz_path}  ({rows}×{cols})")
         print(f"[DATA] Meta:  {meta_path}")
@@ -556,7 +598,8 @@ class CScanService:
                 "image/png",
             )
 
-        self._set(images={label: f"/local/{filename}"})
+        rel_path = os.path.relpath(local_path, self.config.get("base_out_dir", "data/cscan"))
+        self._set(images={label: f"/local/{rel_path.replace(os.sep, '/')}"})
 
     # -------------------------------------------------------------------------
     # Worker thread
@@ -670,13 +713,13 @@ class CScanService:
                 # This corrects LTR/RTL lateral offset (backlash) line by line.
                 if ltr:
                     ra, sh_e = align_row_minblur(ra, ref_e, prev_shift=sh_e)
-                    rf, _    = align_row_minblur(rf, ref_e, prev_shift=sh_e)
-                    re, _    = align_row_minblur(re, ref_e, prev_shift=sh_e)
+                    rf       = apply_fractional_shift(rf, sh_e)
+                    re       = apply_fractional_shift(re, sh_e)
                     ref_e    = ra.copy()   # update rolling LTR reference
                 else:
                     ra, sh_o = align_row_minblur(ra, ref_o, prev_shift=sh_o)
-                    rf, _    = align_row_minblur(rf, ref_o, prev_shift=sh_o)
-                    re, _    = align_row_minblur(re, ref_o, prev_shift=sh_o)
+                    rf       = apply_fractional_shift(rf, sh_o)
+                    re       = apply_fractional_shift(re, sh_o)
                     ref_o    = ra.copy()   # update rolling RTL reference
 
                 img_amp[i] = ra
@@ -689,25 +732,32 @@ class CScanService:
                     self._save_plot(img_tof, "scan_tof.png", "ToF")
                     self._save_plot(img_eng, "scan_eng.png", "Energy")
 
-            if not self._stop_event.is_set():
-                self._set(progress={"msg": "Returning to Start..."})
-                pr.move_to_position(0.0, 0.0, fast=True)
-                pr.wait_for_completion()
+            stopped = self._stop_event.is_set()
+            self._set(progress={"msg": "Returning to Start..."})
+            pr.move_to_position(0.0, 0.0, fast=True)
+            pr.wait_for_completion()
 
-                hs_info = {
-                    "fs_hz":             hs.fs,
-                    "detected_prf_hz":   round(hs.detected_prf, 2),
-                    "gate_us":           [round(hs.g0 / hs.fs * 1e6, 3),
-                                          round(hs.g1 / hs.fs * 1e6, 3)],
-                    "gate_samples":      hs.gate_len,
-                    "sync_thresholds_v": [round(hs.ch2_lo, 4), round(hs.ch2_hi, 4)],
-                }
-                self._save_final_npz(img_amp, img_tof, img_eng, hs_info)
+            hs_info = {
+                "fs_hz":             hs.fs,
+                "detected_prf_hz":   round(hs.detected_prf, 2),
+                "gate_us":           [round(hs.g0 / hs.fs * 1e6, 3),
+                                      round(hs.g1 / hs.fs * 1e6, 3)],
+                "gate_samples":      hs.gate_len,
+                "sync_thresholds_v": [round(hs.ch2_lo, 4), round(hs.ch2_hi, 4)],
+                "partial":           stopped,
+            }
+            self._save_final_npz(img_amp, img_tof, img_eng, hs_info)
 
-            self._set(status="COMPLETED", progress={"msg": "Scan Finished."})
+            if stopped:
+                self._set(status="STOPPED", progress={"msg": "Scan stopped; partial data saved."})
+                self._write_session_manifest("stopped")
+            else:
+                self._set(status="COMPLETED", progress={"msg": "Scan Finished."})
+                self._write_session_manifest("completed")
 
         except Exception as e:
             self._set(status="ERROR", progress={"msg": f"Error: {e}"})
+            self._write_session_manifest("error")
             print(f"[ERROR] {e}")
             traceback.print_exc()
         finally:

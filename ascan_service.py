@@ -58,6 +58,11 @@ experiment to add notes or correct SOC values.
 
 import json
 import os
+import platform
+import re
+import socket
+import subprocess
+import sys
 import time
 import threading
 import traceback
@@ -69,6 +74,57 @@ import numpy as np
 
 from hs5_control import HS5StreamPeaks, envelope_hilbert
 from cloud_manager import CloudManager
+
+
+# Schema version — bump when on-disk layout changes in a way readers must branch on.
+# 1.x = legacy (save_raw_waveforms boolean, no /waveforms_std, no quality metadata).
+# 2.0 = raw_mode tiered retention, /waveforms_std present, n_rejected/prf_actual scalars,
+#       provenance attributes (git_commit, schema_version, code_version, host).
+SCHEMA_VERSION  = "2.0"
+SERVICE_VERSION = "ascan_service v2.0"
+
+
+def _safe_session_name(name: str, fallback: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "").strip()).strip("._-")
+    return safe or fallback
+
+
+def _provenance_attrs() -> dict:
+    """Snapshot of code + runtime identity, embedded in every HDF5 archive.
+
+    Stored as root attributes so a file from any past session can be matched
+    back to the exact code that wrote it (git_commit) and the host that ran
+    the experiment. Falls back to empty strings if git or system calls fail —
+    never raises, since this is metadata, not data.
+    """
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+    except Exception:
+        commit = ""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "code_version":   SERVICE_VERSION,
+        "git_commit":     commit,
+        "host":           socket.gethostname(),
+        "python_version": sys.version.split()[0],
+        "platform":       platform.platform(),
+    }
+
+
+def _normalize_raw_mode(cfg: dict) -> dict:
+    """Translate legacy `save_raw_waveforms: bool` into the new `raw_mode` field.
+
+    Accepts either form so older clients (e.g. unmigrated dashboards) keep
+    working. If both are present, `raw_mode` wins. Mutates and returns cfg.
+    """
+    if "save_raw_waveforms" in cfg and "raw_mode" not in cfg:
+        cfg["raw_mode"] = "full" if cfg.pop("save_raw_waveforms") else "off"
+    elif "save_raw_waveforms" in cfg:
+        cfg.pop("save_raw_waveforms")
+    return cfg
 
 
 class AScanService:
@@ -99,12 +155,25 @@ class AScanService:
         # Default acquisition parameters — overridden per session via start_session()
         self.config = {
             "interval_s":    1.0,           # seconds between averaged snapshots
+            "base_out_dir":  "data/ascan",  # parent directory for session folders
             "out_dir":       "data/ascan",  # output directory (relative to CWD)
             "session_name":  "",            # label for the HDF5 filename (optional)
             "gate_us_start": 30.0,          # gate window start (µs from sync edge)
             "gate_us_end":   40.0,          # gate window end   (µs from sync edge)
             "fs_hz":         20_000_000,    # oscilloscope sample rate (Hz)
             "ch1_range":     1.0,           # CH1 voltage range (V)
+
+            # Raw pulse retention. Coherent averaging means the per-snapshot
+            # /waveforms dataset already captures the scientific signal at √N
+            # better SNR than any single pulse, so default to discarding raw.
+            #   off       — average + features only (smallest, ~kB/hour)
+            #   window    — keep every raw pulse for the first raw_window_s seconds
+            #               (so you can verify averaging worked), then averaged-only
+            #   decimated — keep every raw_decimate_k-th pulse for the whole session
+            #   full      — keep every raw pulse (largest, ~GB/hour at PRF≈1 kHz)
+            "raw_mode":       "off",
+            "raw_window_s":   60.0,
+            "raw_decimate_k": 100,
         }
 
         # Rolling deque of the last 500 feature-point dicts — feeds the live charts.
@@ -115,9 +184,11 @@ class AScanService:
         self._annotations = []     # list of event annotation dicts
         self._h5_path     = None   # absolute path to the open HDF5 file
         self._ann_path    = None   # absolute path to the annotations JSON sidecar
+        self._session_dir = None   # folder containing all files for this session
         self._session_id  = None   # unique session identifier string
         self._session_t0  = 0.0   # wall-clock time at session start
         self._n_snapshots = 0      # number of snapshots written so far
+        self._n_raw_pulses = 0     # number of raw pulse waveforms written so far
 
     # -------------------------------------------------------------------------
     # Public API
@@ -145,8 +216,13 @@ class AScanService:
                 "annotations": list(self._annotations),
                 "session_id":  self._session_id,
                 "file":        os.path.basename(self._h5_path) if self._h5_path else None,
+                "folder":      self._session_dir,
                 "gate_us":     [self.config["gate_us_start"], self.config["gate_us_end"]],
                 "fs_hz":       self.config["fs_hz"],
+                "raw_mode":       str(self.config.get("raw_mode", "off")),
+                "raw_window_s":   float(self.config.get("raw_window_s", 60.0)),
+                "raw_decimate_k": int(self.config.get("raw_decimate_k", 100)),
+                "n_raw_pulses":   self._n_raw_pulses,
             }
 
     def start_session(self, new_config: dict | None = None) -> tuple[bool, str]:
@@ -166,13 +242,15 @@ class AScanService:
         if self.running:
             return False, "Session already active"
         if new_config:
-            self.config.update(new_config)
+            self.config.update(_normalize_raw_mode(dict(new_config)))
 
         ts   = int(time.time())
-        name = self.config.get("session_name", "").strip().replace(" ", "_")
+        name = _safe_session_name(self.config.get("session_name", ""), "session")
         stem = f"ascan_{name}_{ts}" if name else f"ascan_{ts}"
-        out  = self.config["out_dir"]
+        base_out = self.config.get("base_out_dir", "data/ascan")
+        out = os.path.join(base_out, stem)
         os.makedirs(out, exist_ok=True)
+        self.config["out_dir"] = out
 
         self._stop_event.clear()
         with self._lock:
@@ -180,12 +258,15 @@ class AScanService:
             self._annotations.clear()
             self._latest_wf    = None
             self._n_snapshots  = 0
+            self._n_raw_pulses = 0
             self._session_id   = stem
+            self._session_dir  = out
             self._h5_path      = os.path.join(out, f"{stem}.h5")
             self._ann_path     = os.path.join(out, f"{stem}_annotations.json")
             self._session_t0   = time.time()
             self.status        = "RECORDING"
             self.progress      = {"msg": "Starting...", "n_snapshots": 0, "duration_s": 0}
+        self._write_session_manifest("starting")
 
         self.running = True
         threading.Thread(target=self._worker, daemon=True).start()
@@ -268,6 +349,28 @@ class AScanService:
             if status   is not None: self.status = status
             if progress is not None: self.progress.update(progress)
 
+    def _write_session_manifest(self, state: str):
+        if not self._session_dir:
+            return
+        manifest = {
+            "mode": "ascan",
+            "state": state,
+            "session_id": self._session_id,
+            "session_dir": self._session_dir,
+            "h5_file": os.path.basename(self._h5_path) if self._h5_path else None,
+            "annotations_file": os.path.basename(self._ann_path) if self._ann_path else None,
+            "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+            "progress": dict(self.progress),
+            "n_snapshots": self._n_snapshots,
+            "n_raw_pulses": self._n_raw_pulses,
+            "config": dict(self.config),
+        }
+        try:
+            with open(os.path.join(self._session_dir, "session_manifest.json"), "w") as f:
+                json.dump(manifest, f, indent=2)
+        except Exception as e:
+            print(f"[ASCAN] Manifest write error: {e}")
+
     # -------------------------------------------------------------------------
     # Worker thread
     # -------------------------------------------------------------------------
@@ -323,17 +426,33 @@ class AScanService:
 
             # Root-level attributes capture all session parameters for later analysis
             h5f.attrs["session_id"]      = self._session_id
+            h5f.attrs["session_dir"]     = self._session_dir
             h5f.attrs["fs_hz"]           = hs.fs
             h5f.attrs["gate_us_start"]   = cfg["gate_us_start"]
             h5f.attrs["gate_us_end"]     = cfg["gate_us_end"]
             h5f.attrs["gate_samples"]    = gate_len
             h5f.attrs["detected_prf_hz"] = hs.detected_prf
             h5f.attrs["interval_s"]      = interval
+            h5f.attrs["raw_mode"]        = str(cfg.get("raw_mode", "off"))
+            h5f.attrs["raw_window_s"]    = float(cfg.get("raw_window_s", 60.0))
+            h5f.attrs["raw_decimate_k"]  = int(cfg.get("raw_decimate_k", 100))
             h5f.attrs["timestamp_iso"]   = datetime.now(timezone.utc).isoformat()
+            for k, v in _provenance_attrs().items():
+                h5f.attrs[k] = v
 
-            # Waveform dataset: 2-D, chunks of 100 rows × gate_len columns
+            # Coherent average per snapshot — the primary scientific signal
             h5f.create_dataset(
                 "waveforms",
+                shape=(0, gate_len), maxshape=(None, gate_len),
+                dtype="f4", chunks=(100, gate_len),
+                compression="gzip", compression_opts=4,
+            )
+            # Per-sample standard deviation across the pulses in each snapshot.
+            # Cheap quality-metadata layer (~1 MB/hour) that lets downstream
+            # similarity / change-detection work apply weighted metrics and
+            # produce confidence intervals without keeping every raw pulse.
+            h5f.create_dataset(
+                "waveforms_std",
                 shape=(0, gate_len), maxshape=(None, gate_len),
                 dtype="f4", chunks=(100, gate_len),
                 compression="gzip", compression_opts=4,
@@ -341,46 +460,90 @@ class AScanService:
 
             # Scalar feature time-series: 1-D, large chunks (5000) minimise
             # seek overhead when reading a long session sequentially later.
+            #   n_averaged — pulses successfully averaged into this snapshot
+            #   n_rejected — pulses expected (PRF×interval) but not received
+            #                (sync misses, refractory drops, scope underrun)
+            #   prf_actual — kept-pulses-per-second; compare to detected_prf_hz
+            #                to gauge acquisition health drift over a session
             for ds_name, dtype in [
-                ("timestamps", "f8"),   # float64 Unix time
+                ("timestamps", "f8"),
                 ("amplitude",  "f4"),
                 ("tof_us",     "f4"),
                 ("energy",     "f4"),
-                ("n_averaged", "i4"),   # int32 pulse count per snapshot
+                ("n_averaged", "i4"),
+                ("n_rejected", "i4"),
+                ("prf_actual", "f4"),
             ]:
                 h5f.create_dataset(ds_name, shape=(0,), maxshape=(None,),
                                    dtype=dtype, chunks=(5000,))
+
+            raw_mode       = str(cfg.get("raw_mode", "off"))
+            raw_window_s   = float(cfg.get("raw_window_s", 60.0))
+            raw_decimate_k = max(1, int(cfg.get("raw_decimate_k", 100)))
+            if raw_mode != "off":
+                # `full` writes ~PRF rows per snapshot; window/decimated write
+                # far fewer, so smaller chunks reduce wasted space at session end.
+                chunk_rows = 1024 if raw_mode == "full" else 256
+                h5f.create_dataset(
+                    "raw_waveforms",
+                    shape=(0, gate_len), maxshape=(None, gate_len),
+                    dtype="f4", chunks=(chunk_rows, gate_len),
+                    compression="gzip", compression_opts=6,   # bumped from 2
+                )
+                for ds_name, dtype in [
+                    ("raw_timestamps",     "f8"),
+                    ("raw_snapshot_index", "i4"),
+                    ("raw_amplitude",      "f4"),
+                    ("raw_tof_us",         "f4"),
+                    ("raw_energy",         "f4"),
+                ]:
+                    h5f.create_dataset(ds_name, shape=(0,), maxshape=(None,),
+                                       dtype=dtype, chunks=(10000,))
 
             self._set(status="RECORDING", progress={"msg": "Recording..."})
 
             # Flush the HDF5 file every ~10 s to bound data loss on crash
             flush_every = max(1, int(10 / interval))
             flush_count = 0
+            wall_clock_offset = time.time() - time.perf_counter()
 
             # ---- Main acquisition loop -------------------------------------------
             while not self._stop_event.is_set():
-                _, _, _, _, wf = hs.acquire_peaks(duration_s=interval,
-                                                   save_waveforms=True)
+                tt, aa, tf, ee, wf = hs.acquire_peaks(duration_s=interval,
+                                                       save_waveforms=True)
                 if wf is None or wf.shape[0] == 0:
                     continue   # no pulses detected — skip this interval
 
-                # Coherent average preserves phase — required for accurate ToF tracking
+                # Coherent average preserves phase — required for accurate ToF tracking.
+                # Per-sample std is computed from the same pulses; doubling the T2
+                # archive cost buys reliability flags + bootstrap CIs without raw.
                 avg_wf = np.mean(wf, axis=0).astype(np.float32)
-                n_avg  = int(wf.shape[0])   # number of raw pulses averaged
+                std_wf = np.std(wf, axis=0).astype(np.float32)
+                n_avg  = int(wf.shape[0])
+
+                # Acquisition-health metrics. detected_prf is the calibrated PRF
+                # at session start; n_rejected is the deficit relative to that —
+                # rises if sync edges are missed or the scope underruns.
+                expected   = int(round(hs.detected_prf * interval))
+                n_rejected = max(0, expected - n_avg)
+                prf_actual = float(n_avg / max(interval, 1e-9))
 
                 # Feature extraction on the averaged waveform (with fresh DC removal)
                 v   = (avg_wf - float(np.mean(avg_wf))).astype(np.float32)
                 env = envelope_hilbert(v)
                 pk  = int(np.argmax(env))
                 amp = float(env[pk])
-                tof = float(pk / hs.fs * 1e6)   # peak sample index → µs within gate
+                tof = float(pk / hs.fs * 1e6)
                 eng = float(np.dot(v, v))
-                ts  = time.time()
+                ts       = time.time()
+                elapsed  = ts - self._session_t0
 
-                # Append one row to each HDF5 dataset by growing them by 1
+                # Append one row to each per-snapshot dataset by growing them by 1
                 n = h5f["waveforms"].shape[0]
                 h5f["waveforms"].resize((n + 1, gate_len))
                 h5f["waveforms"][n] = avg_wf
+                h5f["waveforms_std"].resize((n + 1, gate_len))
+                h5f["waveforms_std"][n] = std_wf
 
                 for ds_name, val in [
                     ("timestamps", ts),
@@ -388,9 +551,39 @@ class AScanService:
                     ("tof_us",     tof),
                     ("energy",     eng),
                     ("n_averaged", n_avg),
+                    ("n_rejected", n_rejected),
+                    ("prf_actual", prf_actual),
                 ]:
                     h5f[ds_name].resize((n + 1,))
                     h5f[ds_name][n] = val
+
+                # Decide which raw pulses (if any) to archive this snapshot.
+                # `full` keeps everything; `window` keeps everything for the first
+                # raw_window_s seconds then stops; `decimated` keeps every K-th
+                # pulse for the whole session.
+                raw_idx = None
+                if raw_mode == "full":
+                    raw_idx = np.arange(n_avg, dtype=np.int64)
+                elif raw_mode == "window" and elapsed < raw_window_s:
+                    raw_idx = np.arange(n_avg, dtype=np.int64)
+                elif raw_mode == "decimated":
+                    raw_idx = np.arange(0, n_avg, raw_decimate_k, dtype=np.int64)
+
+                if raw_idx is not None and raw_idx.size > 0:
+                    m  = int(raw_idx.size)
+                    r0 = h5f["raw_waveforms"].shape[0]
+                    r1 = r0 + m
+                    h5f["raw_waveforms"].resize((r1, gate_len))
+                    h5f["raw_waveforms"][r0:r1] = wf[raw_idx].astype(np.float32, copy=False)
+                    for ds_name, val in [
+                        ("raw_timestamps",     tt[raw_idx] + wall_clock_offset),
+                        ("raw_snapshot_index", np.full(m, n, dtype=np.int32)),
+                        ("raw_amplitude",      aa[raw_idx]),
+                        ("raw_tof_us",         tf[raw_idx]),
+                        ("raw_energy",         ee[raw_idx]),
+                    ]:
+                        h5f[ds_name].resize((r1,))
+                        h5f[ds_name][r0:r1] = val
 
                 flush_count += 1
                 if flush_count >= flush_every:
@@ -398,9 +591,10 @@ class AScanService:
                     flush_count = 0
 
                 # Update shared state for the dashboard
-                elapsed = round(ts - self._session_t0, 1)
                 with self._lock:
                     self._n_snapshots += 1
+                    if raw_idx is not None:
+                        self._n_raw_pulses += int(raw_idx.size)
                     self._latest_wf    = avg_wf
                     self._history.append({
                         "t":   round(elapsed, 2),
@@ -412,7 +606,8 @@ class AScanService:
                     self.progress = {
                         "msg":         f"{self._n_snapshots} snapshots  |  {elapsed:.0f}s",
                         "n_snapshots":  self._n_snapshots,
-                        "duration_s":   elapsed,
+                        "duration_s":   round(elapsed, 1),
+                        "n_raw_pulses": self._n_raw_pulses,
                     }
 
             # ---- Session complete ------------------------------------------------
@@ -426,6 +621,8 @@ class AScanService:
                           "n_snapshots": n_done},
             )
 
+            self._write_session_manifest("stopped")
+
             # Upload the completed HDF5 file to S3 for archival
             if self.cloud.enabled and self._h5_path:
                 self.cloud.upload_async(
@@ -436,6 +633,7 @@ class AScanService:
 
         except Exception as e:
             self._set(status="ERROR", progress={"msg": f"Error: {e}"})
+            self._write_session_manifest("error")
             print(f"[ASCAN ERROR] {e}")
             traceback.print_exc()
         finally:

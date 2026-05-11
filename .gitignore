@@ -20,6 +20,12 @@ env/
 # and should be archived separately, not stored in git.
 data/
 
+# --- Server runtime logs ----------------------------------------
+# Captured stdout/stderr from past `uvicorn server:app` runs.
+# Operational noise, not scientific data — regenerated every launch.
+uvicorn_*.log
+uvicorn_*.err.log
+
 # --- OS / editor noise ------------------------------------------
 .DS_Store
 Thumbs.db
