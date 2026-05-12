@@ -13,13 +13,21 @@ redistribution, and SEI growth — can be tracked over time.
 
 Key quantities monitored
 ------------------------
-  Amplitude — envelope peak of the averaged waveform.
+  Amplitude — envelope value at the tracked echo position (V).
               Decreases as acoustic attenuation increases (e.g. gas evolution,
               delamination, or electrolyte drying at high SOC).
-  ToF       — time-of-flight of the echo peak within the gate (µs).
-              Shifts as electrode thickness or sound velocity changes with SOC.
-  Energy    — integral of squared waveform.
-              Correlates with total transmitted acoustic power.
+  ToF       — time-of-flight of the *tracked* echo packet, with two reports:
+                tof_us            position within the gate (µs)
+                tof_us_absolute   = gate_us_start + tof_us, from sync edge (µs)
+              Tracking follows the reference echo packet established from the
+              first `tracking_ref_n` snapshots; new waveforms are aligned by
+              constrained cross-correlation, so the same wave packet is
+              followed even when SOC/temperature drift moves it or when a
+              competing reflector becomes momentarily larger.
+              `tof_us_envelope` is the legacy argmax-of-envelope ToF, kept
+              as a diagnostic so peak-hopping artifacts remain visible.
+  Energy    — sum of squared DC-removed samples (V²·samples). Correlates with
+              total transmitted acoustic power.
 
 Coherent averaging
 ------------------
@@ -28,32 +36,46 @@ All raw pulses received within one snapshot interval are coherently averaged
 which is essential for accurate sub-sample ToF tracking. It also improves SNR
 by √N where N is the number of pulses averaged (~PRF × interval_s).
 
-HDF5 file layout  (data/ascan/<session_id>.h5)
-----------------------------------------------
-Attributes (session-level metadata):
-  session_id        str      unique identifier, e.g. "ascan_cell_A1_1715000000"
-  fs_hz             float    oscilloscope sample rate (Hz)
-  gate_us_start     float    gate window start (µs from sync edge)
-  gate_us_end       float    gate window end   (µs from sync edge)
-  gate_samples      int      number of samples per averaged waveform
-  detected_prf_hz   float    measured pulse repetition frequency
-  interval_s        float    snapshot interval (seconds)
-  timestamp_iso     str      ISO-8601 UTC session start time
+HDF5 file layout  (data/ascan/<session_id>/<session_id>.h5)
+-----------------------------------------------------------
+Root attributes (session-level metadata):
+  session_id, session_dir, fs_hz, gate_us_start, gate_us_end, gate_samples,
+  detected_prf_hz, interval_s, raw_mode, raw_window_s, raw_decimate_k,
+  tracking_ref_n, tracking_max_lag_us, tracking_reference_ready_at_snapshot,
+  tracking_reference_peak_us, schema_version, code_version, git_commit, host,
+  python_version, platform, timestamp_iso, and (when triggered)
+  coupling_warning, coupling_warning_at_s, coupling_baseline_v.
 
-Datasets (all resizable, chunk-compressed, appended one row per snapshot):
-  /waveforms  [N, gate_samples]  float32   coherently-averaged gate windows
-  /timestamps [N]                float64   Unix wall-clock time of each snapshot
-  /amplitude  [N]                float32   envelope peak of averaged waveform (V)
-  /tof_us     [N]                float32   envelope peak time within gate (µs)
-  /energy     [N]                float32   sum-of-squares of averaged waveform
-  /n_averaged [N]                int32     number of raw pulses averaged
+Per-snapshot datasets (all resizable, chunk-compressed, one row per snapshot):
+  /waveforms              [N, gate_samples]  float32  coherent average
+  /waveforms_std          [N, gate_samples]  float32  per-sample std across pulses
+  /timestamps             [N]                float64  Unix wall-clock time
+  /amplitude              [N]                float32  envelope @ tracked peak (V)
+  /amplitude_envelope     [N]                float32  envelope argmax peak (V) — legacy
+  /tof_us                 [N]                float32  tracked ToF, gate-relative (µs)
+  /tof_us_absolute        [N]                float32  tracked ToF from sync edge (µs)
+  /tof_us_envelope        [N]                float32  legacy argmax-envelope ToF (µs)
+  /tracking_lag_samples   [N]                float32  xcorr lag from reference (samples)
+  /tracking_corr          [N]                float32  normalized xcorr coefficient
+  /tracking_method        [N]                int8     0=envelope fallback, 1=xcorr
+  /energy                 [N]                float32  Σ(v²) of averaged waveform
+  /n_averaged             [N]                int32    pulses averaged
+  /n_rejected             [N]                int32    pulses expected but not received
+  /prf_actual             [N]                float32  kept-pulses-per-second
+
+Optional /raw_* datasets (only present when raw_mode != 'off'):
+  /raw_waveforms          [M, gate_samples]  float32  individual pulse waveforms
+  /raw_timestamps         [M]                float64
+  /raw_snapshot_index     [M]                int32
+  /raw_amplitude          [M]                float32
+  /raw_tof_us             [M]                float32
+  /raw_energy             [M]                float32
 
 SOC/event annotations
 ---------------------
-Stored in data/ascan/<session_id>_annotations.json — a JSON array, one object
-per event. Each object has: timestamp, timestamp_iso, elapsed_s, soc_pct,
-label, snapshot_idx. The file is human-readable and can be edited after the
-experiment to add notes or correct SOC values.
+Stored in data/ascan/<session_id>/<session_id>_annotations.json — a JSON array,
+one object per event. Each object has: timestamp, timestamp_iso, elapsed_s,
+soc_pct, label, snapshot_idx.
 """
 
 import json
@@ -80,9 +102,87 @@ from cloud_manager import CloudManager
 # 1.x = legacy (save_raw_waveforms boolean, no /waveforms_std, no quality metadata).
 # 2.0 = raw_mode tiered retention, /waveforms_std present, n_rejected/prf_actual scalars,
 #       provenance attributes (git_commit, schema_version, code_version, host).
-SCHEMA_VERSION  = "2.0"
-SERVICE_VERSION = "ascan_service v2.0"
+# 2.1 = live reference-envelope tracking; tof_us is now the *tracked* echo position,
+#       tof_us_absolute and tof_us_envelope are added; tracking_lag/corr/method captured.
+SCHEMA_VERSION  = "2.1"
+SERVICE_VERSION = "ascan_service v2.1"
 
+
+# =============================================================================
+# Helpers — tracking primitives
+# =============================================================================
+
+def _parabolic_peak(y: np.ndarray, k: int) -> float:
+    """Sub-sample peak location from a three-point quadratic fit around index k.
+
+    Standard interpolation trick: fit y = ax² + bx + c through (k-1, k, k+1)
+    and return the vertex x-coordinate. The fractional offset delta is clamped
+    to [-1, 1] to suppress occasional outliers when the curvature is tiny.
+    """
+    if y.size < 3 or k <= 0 or k >= y.size - 1:
+        return float(k)
+    y0, y1, y2 = float(y[k - 1]), float(y[k]), float(y[k + 1])
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-12:
+        return float(k)
+    delta = 0.5 * (y0 - y2) / denom
+    return float(k) + max(-1.0, min(1.0, delta))
+
+
+def _sample_at_fractional(y: np.ndarray, x: float) -> float:
+    """Linear interpolation of y at fractional sample index x, edge-clamped."""
+    if y.size == 0:
+        return float("nan")
+    if x <= 0:
+        return float(y[0])
+    if x >= y.size - 1:
+        return float(y[-1])
+    i = int(np.floor(x))
+    frac = float(x - i)
+    return float((1.0 - frac) * y[i] + frac * y[i + 1])
+
+
+def _track_envelope_xcorr(
+    env: np.ndarray,
+    ref_env: np.ndarray,
+    ref_peak_sample: float,
+    max_lag_samples: int,
+) -> tuple[float, float, float]:
+    """Track the reference echo packet by constrained envelope cross-correlation.
+
+    Returns (tracked_peak_sample, lag_samples, normalized_correlation).
+    The search is restricted to |lag| <= max_lag_samples so the xcorr cannot
+    lock onto a spurious correlation peak far from where the echo physically is.
+    NaN-tuple is returned only when both arrays are degenerate; otherwise the
+    function falls back to lag=0 with NaN correlation.
+    """
+    if env.size == 0 or ref_env.size == 0 or env.size != ref_env.size:
+        return float("nan"), float("nan"), float("nan")
+
+    max_lag = max(1, min(int(max_lag_samples), env.size // 2))
+    env_zm = env.astype(np.float32, copy=False) - float(np.mean(env))
+    ref_zm = ref_env.astype(np.float32, copy=False) - float(np.mean(ref_env))
+
+    denom = float(np.linalg.norm(env_zm) * np.linalg.norm(ref_zm))
+    if denom <= 1e-12:
+        return ref_peak_sample, 0.0, float("nan")
+
+    xc = np.correlate(env_zm, ref_zm, mode="full")
+    center = env.size - 1
+    lo = center - max_lag
+    hi = center + max_lag + 1
+    window = xc[lo:hi]
+    k_local = int(np.argmax(window))
+    k_abs = lo + k_local
+    k_refined = _parabolic_peak(xc, k_abs)
+    lag_samples = float(k_refined - center)
+    corr = float(xc[k_abs] / denom)
+    return float(ref_peak_sample + lag_samples), lag_samples, corr
+
+
+# =============================================================================
+# Helpers — file naming, provenance, config translation
+# =============================================================================
 
 def _safe_session_name(name: str, fallback: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "").strip()).strip("._-")
@@ -117,8 +217,8 @@ def _provenance_attrs() -> dict:
 def _normalize_raw_mode(cfg: dict) -> dict:
     """Translate legacy `save_raw_waveforms: bool` into the new `raw_mode` field.
 
-    Accepts either form so older clients (e.g. unmigrated dashboards) keep
-    working. If both are present, `raw_mode` wins. Mutates and returns cfg.
+    Accepts either form so older clients keep working. If both are present,
+    `raw_mode` wins. Mutates and returns cfg.
     """
     if "save_raw_waveforms" in cfg and "raw_mode" not in cfg:
         cfg["raw_mode"] = "full" if cfg.pop("save_raw_waveforms") else "off"
@@ -126,6 +226,10 @@ def _normalize_raw_mode(cfg: dict) -> dict:
         cfg.pop("save_raw_waveforms")
     return cfg
 
+
+# =============================================================================
+# Service
+# =============================================================================
 
 class AScanService:
     """
@@ -158,17 +262,27 @@ class AScanService:
             "base_out_dir":  "data/ascan",  # parent directory for session folders
             "out_dir":       "data/ascan",  # output directory (relative to CWD)
             "session_name":  "",            # label for the HDF5 filename (optional)
-            "gate_us_start": 30.0,          # gate window start (µs from sync edge)
-            "gate_us_end":   40.0,          # gate window end   (µs from sync edge)
-            "fs_hz":         20_000_000,    # oscilloscope sample rate (Hz)
-            "ch1_range":     1.0,           # CH1 voltage range (V)
 
-            # Raw pulse retention. Coherent averaging means the per-snapshot
-            # /waveforms dataset already captures the scientific signal at √N
-            # better SNR than any single pulse, so default to discarding raw.
+            # Acquisition gate (CH1 window around each sync edge). Intentionally
+            # wider than the analysis window: must contain the echo across the
+            # full range of expected SOC-driven and thermal ToF drift (~±2 µs in
+            # practice). Reference-envelope tracking picks the right packet
+            # within this wider waveform even when reflectors compete.
+            "gate_us_start": 25.0,
+            "gate_us_end":   50.0,
+
+            "fs_hz":         20_000_000,
+            "ch1_range":     1.0,
+
+            # Reference-envelope tracking settings
+            "tracking_ref_n":      60,      # opening snapshots used as the reference
+            "tracking_max_lag_us": 2.0,     # max allowed drift from reference (µs)
+
+            # Raw pulse retention. Coherent averaging means /waveforms already
+            # captures the science at √N better SNR; default to discarding raw.
             #   off       — average + features only (smallest, ~kB/hour)
             #   window    — keep every raw pulse for the first raw_window_s seconds
-            #               (so you can verify averaging worked), then averaged-only
+            #               (verifies averaging worked), then averaged-only
             #   decimated — keep every raw_decimate_k-th pulse for the whole session
             #   full      — keep every raw pulse (largest, ~GB/hour at PRF≈1 kHz)
             "raw_mode":       "off",
@@ -177,42 +291,30 @@ class AScanService:
         }
 
         # Rolling deque of the last 500 feature-point dicts — feeds the live charts.
-        # Each entry: {"t": elapsed_s, "amp": float, "tof": float,
-        #              "eng": float, "n": int}
         self._history     = deque(maxlen=500)
-        self._latest_wf   = None   # most recently computed averaged waveform (float32)
-        self._annotations = []     # list of event annotation dicts
-        self._h5_path     = None   # absolute path to the open HDF5 file
-        self._ann_path    = None   # absolute path to the annotations JSON sidecar
-        self._session_dir = None   # folder containing all files for this session
-        self._session_id  = None   # unique session identifier string
-        self._session_t0  = 0.0   # wall-clock time at session start
-        self._n_snapshots = 0      # number of snapshots written so far
-        self._n_raw_pulses = 0     # number of raw pulse waveforms written so far
+        self._latest_wf   = None
+        self._annotations = []
+        self._h5_path     = None
+        self._ann_path    = None
+        self._session_dir = None
+        self._session_id  = None
+        self._session_t0  = 0.0
+        self._n_snapshots = 0
+        self._n_raw_pulses = 0
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
     def get_status(self) -> dict:
-        """
-        Return a thread-safe snapshot of the current session state.
-
-        This is the only method called from the FastAPI event-loop thread
-        (the /api/ascan/status endpoint). It returns everything the dashboard
-        needs to update all charts in one HTTP round-trip:
-          - latest averaged waveform (for the waveform canvas)
-          - rolling feature history (for ToF / Amplitude time-series charts)
-          - annotation list (for event log and chart markers)
-          - gate config and fs (so the waveform chart can label the x-axis in µs)
-        """
+        """Thread-safe snapshot used by /api/ascan/status."""
         with self._lock:
             wf = self._latest_wf.tolist() if self._latest_wf is not None else []
             return {
                 "status":      self.status,
                 "progress":    dict(self.progress),
                 "waveform":    wf,
-                "history":     list(self._history)[-200:],   # last 200 points for chart
+                "history":     list(self._history)[-200:],
                 "annotations": list(self._annotations),
                 "session_id":  self._session_id,
                 "file":        os.path.basename(self._h5_path) if self._h5_path else None,
@@ -222,23 +324,13 @@ class AScanService:
                 "raw_mode":       str(self.config.get("raw_mode", "off")),
                 "raw_window_s":   float(self.config.get("raw_window_s", 60.0)),
                 "raw_decimate_k": int(self.config.get("raw_decimate_k", 100)),
-                "n_raw_pulses":   self._n_raw_pulses,
+                "tracking_ref_n":      int(self.config.get("tracking_ref_n", 60)),
+                "tracking_max_lag_us": float(self.config.get("tracking_max_lag_us", 2.0)),
+                "n_raw_pulses": self._n_raw_pulses,
             }
 
     def start_session(self, new_config: dict | None = None) -> tuple[bool, str]:
-        """
-        Start a new A-scan monitoring session.
-
-        Creates the output directory, builds the HDF5 filename from the session
-        name and a Unix timestamp, resets all in-memory state, and spawns the
-        worker daemon thread.
-
-        The HDF5 filename format is:
-            ascan_<session_name>_<unix_ts>.h5   (if session_name provided)
-            ascan_<unix_ts>.h5                  (otherwise)
-
-        Returns (success: bool, message: str).
-        """
+        """Start a new A-scan monitoring session. Returns (success, message)."""
         if self.running:
             return False, "Session already active"
         if new_config:
@@ -273,12 +365,7 @@ class AScanService:
         return True, f"Session started: {stem}"
 
     def stop_session(self) -> tuple[bool, str]:
-        """
-        Signal the worker to finish the current snapshot interval and exit cleanly.
-
-        The worker will flush and close the HDF5 file, then upload it to S3
-        if cloud archival is enabled, before setting self.running = False.
-        """
+        """Signal the worker to finish the current snapshot interval and exit cleanly."""
         if not self.running:
             return False, "No active session"
         self._stop_event.set()
@@ -287,33 +374,12 @@ class AScanService:
         return True, "Stopping..."
 
     def mark_event(self, soc_pct: float | None, label: str = "") -> tuple[bool, str]:
-        """
-        Create a timestamped annotation at the current moment in the session.
-
-        Annotations are written to both the in-memory list (for live dashboard
-        display) and the JSON sidecar on disk (for permanent archival). They
-        appear as vertical dashed amber lines on the ToF and Amplitude charts.
-
-        Typical usage during a cycling experiment:
-          mark_event(80.0, "CC charge start")    — when charging begins at 80 % SOC
-          mark_event(None, "equilibrating")      — during OCV rest (SOC unknown)
-          mark_event(50.0, "CC discharge start") — halfway through discharge
-
-        Parameters
-        ----------
-        soc_pct : float or None
-            Battery state-of-charge in percent. Pass None if SOC is unknown
-            or the cycler has not reported it yet.
-        label : str
-            Short description of the event. Shown on the chart and in the log.
-
-        Returns (success: bool, message: str).
-        """
+        """Create a timestamped SOC/event annotation."""
         if not self.running:
             return False, "No active session"
 
         with self._lock:
-            idx = self._n_snapshots     # snapshot index at the time of the mark
+            idx = self._n_snapshots
             t0  = self._session_t0
 
         ann = {
@@ -322,7 +388,7 @@ class AScanService:
             "elapsed_s":     round(time.time() - t0, 2),
             "soc_pct":       float(soc_pct) if soc_pct is not None else None,
             "label":         label,
-            "snapshot_idx":  idx,   # index into /timestamps dataset at mark time
+            "snapshot_idx":  idx,
         }
 
         with self._lock:
@@ -386,21 +452,18 @@ class AScanService:
         3. Loop until stop_session() is called:
              a. Acquire raw pulses for interval_s seconds.
              b. Coherently average all pulses → one averaged waveform.
-             c. Compute amplitude, ToF, energy from the averaged waveform.
-             d. Append one row to every HDF5 dataset via resize().
-             e. Flush the HDF5 file every ~10 seconds.
-             f. Update the in-memory rolling history and latest_wf.
+             c. Compute envelope; argmax gives a legacy diagnostic ToF.
+             d. While snapshots < tracking_ref_n: accumulate envelopes into the
+                reference; once ready, freeze it and switch to xcorr tracking.
+             e. After reference is ready: cross-correlate current envelope
+                against reference (constrained to ±max_lag_samples), report
+                tracked peak position + lag + correlation.
+             f. Append one row to every per-snapshot dataset.
+             g. (raw_mode != off) Archive selected raw pulses.
+             h. Coupling watchdog: detect amplitude collapse early.
+             i. Flush the HDF5 file every ~10 s.
         4. Final flush + close HDF5.
         5. Upload HDF5 to S3 if cloud is enabled.
-
-        Coherent averaging detail
-        -------------------------
-        np.mean(wf, axis=0) averages the N pulse waveforms along the pulse axis,
-        preserving the phase of the signal. This is equivalent to coherent
-        addition (beamforming in the time domain). SNR improves by √N relative
-        to a single pulse, while the phase — and therefore the ToF — is preserved
-        to sub-sample accuracy. Incoherent (envelope) averaging would smear the
-        phase and reduce ToF sensitivity.
         """
         cfg = self.config
         hs  = None
@@ -418,13 +481,10 @@ class AScanService:
             gate_len = hs.gate_len
             interval = float(cfg["interval_s"])
 
-            # ---- Create HDF5 file ------------------------------------------------
-            # Keep the file open for the whole session. Datasets are created with
-            # maxshape=(None, ...) so resize() can extend them one row at a time.
-            # gzip-4 is a good balance of compression ratio vs. write latency.
+            # ---- Create HDF5 file -------------------------------------------
             h5f = h5py.File(self._h5_path, "w")
 
-            # Root-level attributes capture all session parameters for later analysis
+            # Root-level attributes — session params + provenance + tracking config
             h5f.attrs["session_id"]      = self._session_id
             h5f.attrs["session_dir"]     = self._session_dir
             h5f.attrs["fs_hz"]           = hs.fs
@@ -436,6 +496,8 @@ class AScanService:
             h5f.attrs["raw_mode"]        = str(cfg.get("raw_mode", "off"))
             h5f.attrs["raw_window_s"]    = float(cfg.get("raw_window_s", 60.0))
             h5f.attrs["raw_decimate_k"]  = int(cfg.get("raw_decimate_k", 100))
+            h5f.attrs["tracking_ref_n"]      = int(cfg.get("tracking_ref_n", 60))
+            h5f.attrs["tracking_max_lag_us"] = float(cfg.get("tracking_max_lag_us", 2.0))
             h5f.attrs["timestamp_iso"]   = datetime.now(timezone.utc).isoformat()
             for k, v in _provenance_attrs().items():
                 h5f.attrs[k] = v
@@ -447,10 +509,7 @@ class AScanService:
                 dtype="f4", chunks=(100, gate_len),
                 compression="gzip", compression_opts=4,
             )
-            # Per-sample standard deviation across the pulses in each snapshot.
-            # Cheap quality-metadata layer (~1 MB/hour) that lets downstream
-            # similarity / change-detection work apply weighted metrics and
-            # produce confidence intervals without keeping every raw pulse.
+            # Per-sample std across the pulses in each snapshot — noise reference
             h5f.create_dataset(
                 "waveforms_std",
                 shape=(0, gate_len), maxshape=(None, gate_len),
@@ -458,37 +517,36 @@ class AScanService:
                 compression="gzip", compression_opts=4,
             )
 
-            # Scalar feature time-series: 1-D, large chunks (5000) minimise
-            # seek overhead when reading a long session sequentially later.
-            #   n_averaged — pulses successfully averaged into this snapshot
-            #   n_rejected — pulses expected (PRF×interval) but not received
-            #                (sync misses, refractory drops, scope underrun)
-            #   prf_actual — kept-pulses-per-second; compare to detected_prf_hz
-            #                to gauge acquisition health drift over a session
+            # Scalar feature time-series
             for ds_name, dtype in [
-                ("timestamps", "f8"),
-                ("amplitude",  "f4"),
-                ("tof_us",     "f4"),
-                ("energy",     "f4"),
-                ("n_averaged", "i4"),
-                ("n_rejected", "i4"),
-                ("prf_actual", "f4"),
+                ("timestamps",            "f8"),
+                ("amplitude",             "f4"),
+                ("amplitude_envelope",    "f4"),
+                ("tof_us",                "f4"),
+                ("tof_us_absolute",       "f4"),
+                ("tof_us_envelope",       "f4"),
+                ("tracking_lag_samples",  "f4"),
+                ("tracking_corr",         "f4"),
+                ("tracking_method",       "i1"),
+                ("energy",                "f4"),
+                ("n_averaged",            "i4"),
+                ("n_rejected",            "i4"),
+                ("prf_actual",            "f4"),
             ]:
                 h5f.create_dataset(ds_name, shape=(0,), maxshape=(None,),
                                    dtype=dtype, chunks=(5000,))
 
+            # Optional raw pulse archive — controlled by raw_mode
             raw_mode       = str(cfg.get("raw_mode", "off"))
             raw_window_s   = float(cfg.get("raw_window_s", 60.0))
             raw_decimate_k = max(1, int(cfg.get("raw_decimate_k", 100)))
             if raw_mode != "off":
-                # `full` writes ~PRF rows per snapshot; window/decimated write
-                # far fewer, so smaller chunks reduce wasted space at session end.
                 chunk_rows = 1024 if raw_mode == "full" else 256
                 h5f.create_dataset(
                     "raw_waveforms",
                     shape=(0, gate_len), maxshape=(None, gate_len),
                     dtype="f4", chunks=(chunk_rows, gate_len),
-                    compression="gzip", compression_opts=6,   # bumped from 2
+                    compression="gzip", compression_opts=6,
                 )
                 for ds_name, dtype in [
                     ("raw_timestamps",     "f8"),
@@ -502,43 +560,94 @@ class AScanService:
 
             self._set(status="RECORDING", progress={"msg": "Recording..."})
 
-            # Flush the HDF5 file every ~10 s to bound data loss on crash
+            # Flush every ~10 s — bounds data loss on hard crash to one window
             flush_every = max(1, int(10 / interval))
             flush_count = 0
             wall_clock_offset = time.time() - time.perf_counter()
 
-            # ---- Main acquisition loop -------------------------------------------
+            # Coupling-loss watchdog — see comments where it fires.
+            COUPLING_BASELINE_N      = 60
+            COUPLING_DROP_FRAC       = 0.30
+            COUPLING_STREAK_REQUIRED = 60
+            coupling_baseline   = None
+            coupling_window     = []
+            coupling_streak     = 0
+            coupling_warned     = False
+
+            # Reference-envelope tracker
+            tracking_ref_n           = max(1, int(cfg.get("tracking_ref_n", 60)))
+            tracking_max_lag_us      = max(0.05, float(cfg.get("tracking_max_lag_us", 2.0)))
+            tracking_max_lag_samples = max(1, int(round(tracking_max_lag_us * 1e-6 * hs.fs)))
+            ref_env_accum  = []
+            ref_env        = None
+            ref_peak_sample = float("nan")
+
+            # ---- Main acquisition loop -------------------------------------
             while not self._stop_event.is_set():
                 tt, aa, tf, ee, wf = hs.acquire_peaks(duration_s=interval,
                                                        save_waveforms=True)
                 if wf is None or wf.shape[0] == 0:
-                    continue   # no pulses detected — skip this interval
+                    continue   # no pulses detected this interval
 
-                # Coherent average preserves phase — required for accurate ToF tracking.
-                # Per-sample std is computed from the same pulses; doubling the T2
-                # archive cost buys reliability flags + bootstrap CIs without raw.
+                # Coherent average + per-sample std
                 avg_wf = np.mean(wf, axis=0).astype(np.float32)
                 std_wf = np.std(wf, axis=0).astype(np.float32)
                 n_avg  = int(wf.shape[0])
 
-                # Acquisition-health metrics. detected_prf is the calibrated PRF
-                # at session start; n_rejected is the deficit relative to that —
-                # rises if sync edges are missed or the scope underruns.
+                # Acquisition-health metrics
                 expected   = int(round(hs.detected_prf * interval))
                 n_rejected = max(0, expected - n_avg)
                 prf_actual = float(n_avg / max(interval, 1e-9))
 
-                # Feature extraction on the averaged waveform (with fresh DC removal)
+                # Envelope of the averaged waveform — used for both the legacy
+                # diagnostic ToF and as input to the cross-correlation tracker.
                 v   = (avg_wf - float(np.mean(avg_wf))).astype(np.float32)
                 env = envelope_hilbert(v)
-                pk  = int(np.argmax(env))
-                amp = float(env[pk])
-                tof = float(pk / hs.fs * 1e6)
-                eng = float(np.dot(v, v))
-                ts       = time.time()
-                elapsed  = ts - self._session_t0
+                pk_env         = int(np.argmax(env))
+                pk_env_refined = _parabolic_peak(env, pk_env)
+                amp_env = float(env[pk_env])
+                tof_env = float(pk_env_refined / hs.fs * 1e6)   # legacy argmax ToF
+                eng     = float(np.dot(v, v))
 
-                # Append one row to each per-snapshot dataset by growing them by 1
+                # Reference build / tracked feature extraction
+                if ref_env is None:
+                    # Accumulate opening envelopes; while accumulating, report
+                    # the envelope-argmax as the tracked peak so dashboard charts
+                    # still show something sensible.
+                    ref_env_accum.append(env.copy())
+                    tracked_peak    = pk_env_refined
+                    tracking_lag    = 0.0
+                    tracking_corr   = float("nan")
+                    tracking_method = 0   # envelope fallback while reference builds
+                    if len(ref_env_accum) >= tracking_ref_n:
+                        ref_env = np.mean(np.stack(ref_env_accum, axis=0),
+                                          axis=0).astype(np.float32)
+                        ref_peak_sample = _parabolic_peak(ref_env, int(np.argmax(ref_env)))
+                        h5f.attrs["tracking_reference_ready_at_snapshot"] = int(h5f["waveforms"].shape[0])
+                        h5f.attrs["tracking_reference_peak_us"] = float(ref_peak_sample / hs.fs * 1e6)
+                        ref_env_accum.clear()
+                        print(f"[ASCAN] tracking reference ready after {tracking_ref_n} snapshots "
+                              f"(ref peak @ {h5f.attrs['tracking_reference_peak_us']:.3f} µs in gate)")
+                else:
+                    tracked_peak, tracking_lag, tracking_corr = _track_envelope_xcorr(
+                        env, ref_env, ref_peak_sample, tracking_max_lag_samples,
+                    )
+                    tracking_method = 1   # reference-envelope cross-correlation
+                    if not np.isfinite(tracked_peak):
+                        # Degenerate input (e.g. zero waveform) — fall back gracefully
+                        tracked_peak    = pk_env_refined
+                        tracking_lag    = 0.0
+                        tracking_corr   = float("nan")
+                        tracking_method = 0
+
+                tracked_peak = float(np.clip(tracked_peak, 0.0, gate_len - 1.0))
+                amp     = _sample_at_fractional(env, tracked_peak)
+                tof     = float(tracked_peak / hs.fs * 1e6)
+                tof_abs = float(float(cfg["gate_us_start"]) + tof)
+                ts      = time.time()
+                elapsed = ts - self._session_t0
+
+                # Append one row to each per-snapshot dataset
                 n = h5f["waveforms"].shape[0]
                 h5f["waveforms"].resize((n + 1, gate_len))
                 h5f["waveforms"][n] = avg_wf
@@ -546,21 +655,24 @@ class AScanService:
                 h5f["waveforms_std"][n] = std_wf
 
                 for ds_name, val in [
-                    ("timestamps", ts),
-                    ("amplitude",  amp),
-                    ("tof_us",     tof),
-                    ("energy",     eng),
-                    ("n_averaged", n_avg),
-                    ("n_rejected", n_rejected),
-                    ("prf_actual", prf_actual),
+                    ("timestamps",            ts),
+                    ("amplitude",             amp),
+                    ("amplitude_envelope",    amp_env),
+                    ("tof_us",                tof),
+                    ("tof_us_absolute",       tof_abs),
+                    ("tof_us_envelope",       tof_env),
+                    ("tracking_lag_samples",  tracking_lag),
+                    ("tracking_corr",         tracking_corr),
+                    ("tracking_method",       tracking_method),
+                    ("energy",                eng),
+                    ("n_averaged",            n_avg),
+                    ("n_rejected",            n_rejected),
+                    ("prf_actual",            prf_actual),
                 ]:
                     h5f[ds_name].resize((n + 1,))
                     h5f[ds_name][n] = val
 
-                # Decide which raw pulses (if any) to archive this snapshot.
-                # `full` keeps everything; `window` keeps everything for the first
-                # raw_window_s seconds then stops; `decimated` keeps every K-th
-                # pulse for the whole session.
+                # Optional raw pulse archive based on raw_mode
                 raw_idx = None
                 if raw_mode == "full":
                     raw_idx = np.arange(n_avg, dtype=np.int64)
@@ -590,16 +702,52 @@ class AScanService:
                     h5f.flush()
                     flush_count = 0
 
+                # Coupling-loss watchdog — uses the tracked amplitude, which is
+                # already sampling the envelope at the same physical position the
+                # reference echo lives at. A genuine coupling failure will drop
+                # this number sharply, even if some other reflection still rings.
+                if coupling_baseline is None:
+                    coupling_window.append(amp)
+                    if len(coupling_window) >= COUPLING_BASELINE_N:
+                        coupling_baseline = float(np.mean(coupling_window))
+                        print(f"[ASCAN] coupling baseline established: "
+                              f"{coupling_baseline:.3f} V over first "
+                              f"{COUPLING_BASELINE_N} snapshots")
+                else:
+                    if amp < COUPLING_DROP_FRAC * coupling_baseline:
+                        coupling_streak += 1
+                    else:
+                        coupling_streak = 0
+                    if coupling_streak >= COUPLING_STREAK_REQUIRED and not coupling_warned:
+                        msg = (f"WARNING: amplitude has been below "
+                               f"{int(COUPLING_DROP_FRAC*100)}% of baseline "
+                               f"({coupling_baseline:.3f} V) for "
+                               f"{COUPLING_STREAK_REQUIRED} consecutive snapshots — "
+                               f"likely coupling loss. Session continues; "
+                               f"intervene if needed.")
+                        print(f"[ASCAN] {msg}")
+                        coupling_warned = True
+                        h5f.attrs["coupling_warning"]      = True
+                        h5f.attrs["coupling_warning_at_s"] = float(elapsed)
+                        h5f.attrs["coupling_baseline_v"]   = float(coupling_baseline)
+                        with self._lock:
+                            self.progress["coupling_warning"] = True
+                            self.progress["coupling_warning_at_s"] = round(float(elapsed), 1)
+
                 # Update shared state for the dashboard
                 with self._lock:
                     self._n_snapshots += 1
                     if raw_idx is not None:
                         self._n_raw_pulses += int(raw_idx.size)
-                    self._latest_wf    = avg_wf
+                    self._latest_wf = avg_wf
                     self._history.append({
                         "t":   round(elapsed, 2),
                         "amp": round(amp, 6),
-                        "tof": round(tof, 4),
+                        "tof":        round(tof_abs, 4),     # absolute ToF for charts
+                        "tof_rel":    round(tof, 4),
+                        "tof_env":    round(float(cfg["gate_us_start"]) + tof_env, 4),
+                        "track_corr": None if not np.isfinite(tracking_corr)
+                                      else round(tracking_corr, 4),
                         "eng": round(eng, 2),
                         "n":   n_avg,
                     })
@@ -608,9 +756,14 @@ class AScanService:
                         "n_snapshots":  self._n_snapshots,
                         "duration_s":   round(elapsed, 1),
                         "n_raw_pulses": self._n_raw_pulses,
+                        "tof_us_absolute": round(tof_abs, 4),
+                        "tof_us_relative": round(tof, 4),
+                        "tracking_method": "xcorr" if tracking_method == 1 else "envelope",
                     }
+                    if coupling_warned:
+                        self.progress["coupling_warning"] = True
 
-            # ---- Session complete ------------------------------------------------
+            # ---- Session complete ------------------------------------------
             h5f.flush()
             with self._lock:
                 n_done = self._n_snapshots
@@ -623,7 +776,6 @@ class AScanService:
 
             self._write_session_manifest("stopped")
 
-            # Upload the completed HDF5 file to S3 for archival
             if self.cloud.enabled and self._h5_path:
                 self.cloud.upload_async(
                     self._h5_path,

@@ -164,12 +164,16 @@ class AScanConfig(BaseModel):
                                  description="Seconds between averaged snapshots")
     session_name:  str   = Field("",
                                  description="Label included in the output folder and filename")
-    gate_us_start: float = Field(30.0, gt=0, le=200.0,
+    gate_us_start: float = Field(25.0, gt=0, le=200.0,
                                  description="Gate window start (µs from sync edge)")
-    gate_us_end:   float = Field(40.0, gt=0, le=200.0,
+    gate_us_end:   float = Field(50.0, gt=0, le=200.0,
                                  description="Gate window end (µs from sync edge)")
     ch1_range:     float = Field(1.0,  gt=0, le=10.0,
                                  description="CH1 voltage range (V)")
+    tracking_ref_n: int = Field(60, ge=1, le=1000,
+                                description="Opening snapshots used as the A-scan tracking reference")
+    tracking_max_lag_us: float = Field(2.0, gt=0, le=25.0,
+                                       description="Maximum ToF drift allowed from the reference echo")
     raw_mode: Literal["off", "window", "decimated", "full"] = Field(
         "off",
         description=("Raw pulse retention strategy. 'off' (default) saves only the "
@@ -207,9 +211,9 @@ class EventMark(BaseModel):
 class GaugeConfig(BaseModel):
     """Configuration for starting a live ToF gauging session."""
     session_name:  str   = Field("",   description="Label included in the output folder and HDF5 filename")
-    gate_us_start: float = Field(30.0, gt=0, le=200.0,
+    gate_us_start: float = Field(25.0, gt=0, le=200.0,
                                  description="Gate window start (µs from sync edge)")
-    gate_us_end:   float = Field(40.0, gt=0, le=200.0,
+    gate_us_end:   float = Field(50.0, gt=0, le=200.0,
                                  description="Gate window end (µs from sync edge)")
     ch1_range:     float = Field(1.0,  gt=0, le=10.0,
                                  description="CH1 voltage range (V)")

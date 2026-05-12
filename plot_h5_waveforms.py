@@ -66,7 +66,7 @@ def _time_axis_us(f: h5py.File, n_samples: int, dataset_name: str) -> np.ndarray
 def _feature_names(dataset_name: str) -> tuple[str, str, str, str]:
     if dataset_name == "raw_waveforms":
         return "raw_timestamps", "raw_tof_us", "raw_amplitude", "raw_energy"
-    return "timestamps", "tof_us", "amplitude", "energy"
+    return "timestamps", "tof_us_absolute", "amplitude", "energy"
 
 
 def plot_overlay(f: h5py.File, dataset_name: str, out_path: Path,
@@ -136,6 +136,8 @@ def plot_heatmap(f: h5py.File, dataset_name: str, out_path: Path,
 def plot_features(f: h5py.File, dataset_name: str, out_path: Path,
                   max_points: int, start: int) -> bool:
     ts_name, tof_name, amp_name, eng_name = _feature_names(dataset_name)
+    if tof_name not in f and tof_name == "tof_us_absolute":
+        tof_name = "tof_us"
     needed = [tof_name, amp_name, eng_name]
     if not all(name in f for name in needed):
         return False

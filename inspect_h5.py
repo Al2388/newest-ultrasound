@@ -25,6 +25,8 @@ def _fmt_size(num_bytes: int) -> str:
 
 
 def _row_summary(f: h5py.File, i: int, count_name: str, count_label: str) -> str:
+    tof_name = "tof_us_absolute" if "tof_us_absolute" in f else "tof_us"
+    tof_label = "tof_abs" if tof_name == "tof_us_absolute" else "tof"
     parts = [
         f"row {i:<3}",
         f"t={f['timestamps'][i]:.3f}",
@@ -33,6 +35,15 @@ def _row_summary(f: h5py.File, i: int, count_name: str, count_label: str) -> str
         f"eng={f['energy'][i]:.4f}",
         f"{count_label}={f[count_name][i]}",
     ]
+    if "tof_us_absolute" in f:
+        parts.append(f"tof_abs={float(f['tof_us_absolute'][i]):.4f} us")
+    if "tof_us_envelope" in f and "tof_us_absolute" in f:
+        gate_start = float(f.attrs.get("gate_us_start", 0.0))
+        parts.append(f"env_abs={gate_start + float(f['tof_us_envelope'][i]):.4f} us")
+    if "tracking_corr" in f:
+        corr = float(f["tracking_corr"][i])
+        if corr == corr:
+            parts.append(f"xcorr={corr:.3f}")
     # Schema 2.0+ quality metadata, when present
     if "n_rejected" in f:
         parts.append(f"rej={int(f['n_rejected'][i])}")

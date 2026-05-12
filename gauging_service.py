@@ -112,8 +112,8 @@ class GaugingService:
             "base_out_dir":    "data/gauging",
             "out_dir":         "data/gauging",
             "session_name":    "",              # used in the HDF5 filename
-            "gate_us_start":   30.0,            # gate window start (µs)
-            "gate_us_end":     40.0,            # gate window end   (µs)
+            "gate_us_start":   25.0,            # gate window start (µs from sync edge)
+            "gate_us_end":     50.0,            # gate window end   (µs from sync edge)
             "fs_hz":           20_000_000,      # oscilloscope sample rate (Hz)
             "ch1_range":       1.0,             # CH1 voltage range (V)
             "sample_window_s": 0.3,             # acquisition window per row
