@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software in research, please cite it as below."
+title: "Ultrasound Imaging for Li-ion Battery"
+abstract: >-
+  IoT acquisition system for ultrasound characterisation of lithium-ion
+  batteries. Provides C-scan, A-scan, and live ToF gauging modes over a
+  FastAPI dashboard, controlling a TiePie HS5 oscilloscope and a modified
+  Ender 3D printer that positions the transducer.
+authors:
+  - family-names: Liu
+    given-names: Andy
+    email: andyliu238832@gmail.com
+version: 0.3.0
+date-released: 2026-05-16
+license: NOASSERTION
+keywords:
+  - ultrasound
+  - lithium-ion
+  - battery characterisation
+  - non-destructive evaluation
+  - state of charge
+  - IoT
+type: software

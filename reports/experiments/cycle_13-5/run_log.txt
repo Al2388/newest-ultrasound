@@ -1,0 +1,20 @@
+=== ascan_session_2026-05-12_15-42-53.h5 + cycler + temperature ===
+  acoustic:    80,720 snapshots  duration=23.06h  gate=30.0-40.0us  fs=20.0MHz
+  cycler:      7,230 rows  duration=10.04h  V=[2.602,3.664]V  I=[86.1,86.4]mA
+  temperature: 83,024 rows  duration=23.06h  T=[21.27,22.47]C
+
+--- noise / sensitivity summary (charge phase only) ---
+  fit points:                 7230
+  sigma_ToF (smoothed resid): 0.310 ns
+  max |d(ToF)/d(SoC)|:        11.877 ns / %SoC  (steepest section of charge curve)
+  mean |d(ToF)/d(SoC)|:       4.643 ns / %SoC  (averaged across charge)
+  min resolvable dSoC:        0.0522 %  (= 2 sigma / max_sensitivity)
+  sensitivity / noise:        38.3  (GOOD (>10))
+
+--- saved plots ---
+  D:\SIOT\Ultrasound-Imaging-for-Li-ion-Battery-main\13-5 analysis\cycle_13_5_diag_voltage_current.png
+  D:\SIOT\Ultrasound-Imaging-for-Li-ion-Battery-main\13-5 analysis\cycle_13_5_diag_temperature.png
+  D:\SIOT\Ultrasound-Imaging-for-Li-ion-Battery-main\13-5 analysis\cycle_13_5_diag_tof_vs_time.png
+  D:\SIOT\Ultrasound-Imaging-for-Li-ion-Battery-main\13-5 analysis\cycle_13_5_headline_tof_vs_soc.png
+  D:\SIOT\Ultrasound-Imaging-for-Li-ion-Battery-main\13-5 analysis\cycle_13_5_attenuation_vs_soc.png
+  D:\SIOT\Ultrasound-Imaging-for-Li-ion-Battery-main\13-5 analysis\cycle_13_5_cycle_drift.png

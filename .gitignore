@@ -18,13 +18,42 @@ env/
 # --- Scan output data -------------------------------------------
 # All generated data lives under data/ — these can be large (GB+)
 # and should be archived separately, not stored in git.
-data/
+# Track the README and directory placeholders so the convention is clear
+# on a fresh clone.
+data/*
+!data/README.md
+!data/.gitkeep
+!data/raw/
+!data/processed/
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# --- Python packaging artefacts ---------------------------------
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # --- Server runtime logs ----------------------------------------
-# Captured stdout/stderr from past `uvicorn server:app` runs.
+# Captured stdout/stderr from past `uvicorn server:app` / `python server.py` runs
+# and from one-shot scripts (e.g. mirror_data_to_box.py → backfill.log).
 # Operational noise, not scientific data — regenerated every launch.
 uvicorn_*.log
 uvicorn_*.err.log
+webapp_*.log
+webapp_*.err.log
+backfill.log
+*.log
+
+# --- Stray patches / scratch artefacts at root -------------------
+# Backup patches from local experiments, or HDF5 files dropped at the
+# repo root by ad-hoc debugging scripts. Real outputs live under data/.
+/*.patch
+/*.h5
 
 # --- OS / editor noise ------------------------------------------
 .DS_Store

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "ultrasound-battery"
+version         = "0.3.0"
+description     = "IoT ultrasound C-scan / A-scan / gauging system for Li-ion battery research."
+readme          = "README.md"
+requires-python = ">=3.10"
+authors         = [{ name = "Andy Liu", email = "andyliu238832@gmail.com" }]
+keywords        = ["ultrasound", "lithium-ion", "battery", "c-scan", "iot", "fastapi"]
+
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "numpy",
+    "matplotlib",
+    "pyserial",
+    "python-libtiepie",
+    "jinja2",
+    "python-multipart",
+    "boxsdk[jwt]",
+    "h5py",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "openpyxl",   # cycler XLSX
+    "pandas",     # convenience for combined analysis
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+# Console-script entry points. `pip install -e .` registers these on PATH.
+ultrasound-battery = "ultrasound_battery.app.server:main"
+
+[project.urls]
+"Source" = "https://github.com/AndyLiu238832/Ultrasound-Imaging-for-Li-ion-Battery"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"ultrasound_battery.app" = ["templates/*.html"]
