@@ -55,20 +55,47 @@ def envelope_hilbert(x: np.ndarray) -> np.ndarray:
     """
     Compute the analytic-signal envelope of a real-valued 1-D array.
 
-    This is a pure-NumPy Hilbert envelope — identical in result to
-    scipy.signal.hilbert for practical signal lengths, but avoids the SciPy
-    dependency.
+    This is a pure-NumPy implementation that matches ``scipy.signal.hilbert``
+    bit-for-bit on real input, but avoids the SciPy dependency.
 
     Algorithm
     ---------
-    1. Compute the real FFT of x.
-    2. Apply a one-sided weight vector H:
-         H[0]     = 1  (DC, unchanged)
-         H[1:-1]  = 2  (positive freqs, doubled to compensate for discarded
-                         negative-frequency mirror)
-         H[-1]    = 1  (Nyquist bin for even-length signals, half-amplitude)
-    3. Inverse-FFT to get the analytic signal; take the absolute value
-       (magnitude) to get the envelope.
+    1. Compute the full complex FFT of ``x``.
+    2. Apply the analytic-signal one-sided weight vector H of length n:
+         H[0]        = 1   (DC, unchanged)
+         H[1 : n//2] = 2   (positive freqs, doubled to compensate for the
+                            zeroed negative-frequency mirror)
+         H[n//2]     = 1   (Nyquist bin, only present for even n)
+         H[n//2+1 :] = 0   (negative freqs, zeroed)
+    3. Inverse-FFT — yields the complex analytic signal x_a(t) = x(t) + j·Ĥ{x(t)}.
+    4. Take |x_a(t)| sample-by-sample to obtain the real-valued envelope.
+
+    Why full FFT, not rfft/irfft
+    ----------------------------
+    A natural-looking optimisation is to replace steps 1–3 with
+    ``irfft(H · rfft(x))`` since x is real. This is mathematically WRONG for
+    envelope extraction and worth documenting because the inherited prototype
+    used exactly that form:
+
+      * ``rfft(x)`` returns only the positive-frequency half of the spectrum.
+      * ``irfft`` interprets its input as the positive half of a
+        Hermitian-symmetric spectrum and mirror-conjugates the negative half
+        before transforming. The output is therefore the unique *real* signal
+        whose half-spectrum is ``H·rfft(x)`` — equivalently, with the positive
+        weighting [1, 2, 2, …, 2, 1], the signal 2·x(t).
+      * The analytic signal x_a(t) is *complex* — its negative-frequency
+        components are zero, not the conjugate mirror of its positive ones.
+        That asymmetry cannot be represented in the rfft compact form.
+
+    Consequence: ``|irfft(H·rfft(x))|`` = 2·|x(t)|, i.e. a full-wave rectified
+    copy of the carrier. Its peak per gate happens to track the envelope peak
+    on clean tone bursts (which is why the prototype appeared to "work"), but
+    its *shape* is the rectified RF, not the smooth envelope — so any
+    measurement derived from the envelope's shape (most importantly the ToF
+    index ``argmax(env)`` consumed by :meth:`_compute_features`) would be
+    corrupted by zero-crossings of the carrier. The full FFT here is therefore
+    a deliberate choice, not an oversight, and matches the formulation in
+    ``scipy.signal.hilbert`` for the same reason.
 
     Parameters
     ----------
@@ -197,9 +224,35 @@ class HS5StreamPeaks:
         """
         Extract amplitude, time-of-flight, and energy from a single gate window.
 
-        DC offset is removed first so that a large baseline does not inflate the
-        energy value. The Hilbert envelope is always computed (even in p2p modes)
-        because its peak index is needed for the ToF calculation.
+        Pre-processing
+        --------------
+        The DC offset is removed first (``v - mean(v)``) so that:
+          * a non-zero baseline cannot inflate the energy value (which is
+            scale-quadratic and unforgiving of bias), and
+          * the analytic-signal envelope used for ToF is computed on a signal
+            centred on zero, where ``argmax(|x_a|)`` is dominated by the echo
+            and not by any slow drift in the cable / coupling.
+
+        Why the Hilbert envelope is computed unconditionally
+        ----------------------------------------------------
+        The ``feature_mode`` selector only controls the AMPLITUDE estimator
+        (envelope-peak, raw peak-to-peak, or percentile peak-to-peak). The
+        envelope itself is computed for every pulse regardless of mode,
+        because the ToF measurement is defined as the sample index of the
+        envelope peak — there is no "p2p ToF" or "percentile ToF" that would
+        be physically meaningful for a damped echo.
+
+        This is the reason ``envelope_hilbert`` is implemented with the full
+        complex FFT rather than the rfft/irfft shortcut (see that function's
+        docstring): a rectified-carrier surrogate would have peak indices
+        sitting at zero-crossings of the RF rather than at the true envelope
+        peak, biasing the ToF map.
+
+        ToF reference
+        -------------
+        ``tof_us`` is measured from the START of the gate window, not from the
+        sync edge. Add the gate's ``gate_us[0]`` if absolute time-of-flight
+        from transmit is needed.
 
         Parameters
         ----------
@@ -359,9 +412,16 @@ class HS5StreamPeaks:
         self.ch2_lo = vmid - 0.2 * span
         self.ch2_hi = vmid + 0.2 * span
 
-        # Estimate PRF from intervals between falling edges on CH2
-        above = ch2 > self.ch2_hi
-        edges = np.flatnonzero(above[1:] & ~above[:-1])   # falling-edge indices
+        # Estimate PRF from intervals between rising edges on CH2. A Schmitt
+        # trigger (hi/lo hysteresis) is applied vectorised: the latched state
+        # flips high only when ch2 ≥ ch2_hi, and stays high until ch2 ≤ ch2_lo.
+        # This rejects ringing right after the TTL edge — single-threshold
+        # detection would otherwise register one pulse as several.
+        idx     = np.arange(ch2.size, dtype=np.int64)
+        last_hi = np.maximum.accumulate(np.where(ch2 >= self.ch2_hi, idx, -1))
+        last_lo = np.maximum.accumulate(np.where(ch2 <= self.ch2_lo, idx, -1))
+        state   = last_hi > last_lo                             # latched comparator output
+        edges   = np.flatnonzero(state[1:] & ~state[:-1])       # rising-edge sample indices
         if edges.size >= 2:
             self.detected_prf = self.fs / np.median(np.diff(edges))
 

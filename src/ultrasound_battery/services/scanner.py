@@ -60,6 +60,30 @@ from ultrasound_battery.utils import session_timestamp
 
 
 # =============================================================================
+# Alignment tuning constants
+# =============================================================================
+# Maximum lateral shift (image columns) that align_row_minblur will ever apply.
+# Set just above the largest mechanical offset we've measured on the Ender
+# (~5 px for tight pitch, ~8 px after long warm-up drift).
+ALIGN_MAX_SHIFT_PX = 8.0
+
+# Peak-to-Sidelobe Ratio gate. Below this, the cross-correlation peak isn't
+# significantly above the background, so we fall back to the previous shift
+# rather than chase a noise lobe. Empirically tuned on real C-scans where the
+# carrier-to-noise ratio gives PSR ≈ 10–20 for clean rows and < 5 for dropouts.
+ALIGN_PSR_THRESHOLD = 6.0
+
+# Per-row step gate. A real mechanical offset evolves smoothly between adjacent
+# rows; a jump larger than this is almost always a correlation artefact (e.g.
+# row dominated by a single bright pixel pulling the peak off-centre).
+ALIGN_MAX_STEP_PX = 1.8
+
+# PSR sidelobe exclusion half-width — samples either side of the main peak to
+# omit from the background statistics.
+ALIGN_PSR_EXCLUDE_PX = 5
+
+
+# =============================================================================
 # Signal-processing helpers
 # =============================================================================
 
@@ -147,99 +171,112 @@ def row_from_pulses_nosmooth(aa: np.ndarray, ncols: int,
     return out
 
 
-def align_row_minblur(row: np.ndarray, ref: np.ndarray,
-                      max_shift: float = 8.0,
-                      prev_shift: float = 0.0
-                      ) -> tuple[np.ndarray, float]:
+def _phase_corr_psr(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     """
-    Sub-pixel lateral alignment of a scan row against a reference row using
-    phase-only cross-correlation (whitened cross-correlation in the frequency
-    domain).
+    Phase-only cross-correlation between two equal-length 1-D signals.
 
-    Background
-    ----------
-    In a bidi scan, LTR and RTL lines often have a systematic lateral offset
-    caused by belt backlash, motor inertia, and timing jitter. If left
-    uncorrected this produces a "comb" artefact in the image. This function
-    estimates and corrects that offset to sub-pixel precision.
+    Returns the sub-pixel shift (in samples) that best aligns ``a`` onto ``b``,
+    together with the Peak-to-Sidelobe Ratio (PSR) of the correlation surface
+    — a confidence metric for the shift estimate.
 
-    Algorithm
-    ---------
-    1. Compute the cross-correlation of `row` with `ref` in the frequency domain.
-    2. Whiten the cross-correlation (divide by its amplitude) so that the phase
-       shift dominates — this is the "phase-only" cross-correlation.
-    3. Find the peak of the correlation and refine its position to sub-pixel
-       accuracy with parabolic interpolation.
-    4. Compute the Peak-to-Sidelobe Ratio (PSR) to assess confidence:
-       if PSR < 6 or the shift is very different from the previous row, fall
-       back to prev_shift (the last accepted shift for this scan direction).
-    5. Apply the chosen shift via frequency-domain phase multiplication.
-
-    Parameters
-    ----------
-    row        : np.ndarray   Newly acquired row to align (float32, length ncols).
-    ref        : np.ndarray   Reference row — updated to the latest row each call.
-    max_shift  : float        Maximum allowed shift magnitude in columns (default 8).
-    prev_shift : float        Shift used for the previous row in this direction
-                              (used as fallback if the PSR gate rejects the estimate).
+    Caller is responsible for any DC removal / NaN handling on ``a`` and ``b``.
 
     Returns
     -------
-    (aligned_row, shift_used) : tuple[np.ndarray, float]
-        aligned_row — row shifted by shift_used columns (float32).
-        shift_used  — the sub-pixel shift that was applied (columns).
+    shift : float
+        Estimated shift in samples, in the wrapped range ``[-n/2, n/2)``.
+    psr   : float
+        Peak height above the sidelobe-region mean, in units of sidelobe σ.
+        Values > ~6 indicate a well-defined peak; values near 0 indicate the
+        peak is indistinguishable from background noise.
     """
-    if ref is None or not np.any(np.isfinite(ref)):
-        return row, 0.0
+    n = a.size
 
-    a = np.nan_to_num(row, nan=0.0); a -= np.mean(a)
-    b = np.nan_to_num(ref, nan=0.0); b -= np.mean(b)
-    n = len(a)
-
-    # Phase-only cross-correlation: divide out amplitude so only phase (shift)
-    # information remains — prevents high-amplitude regions from biasing the peak.
+    # Whitened cross-correlation: divide out spectral magnitude so only the
+    # phase ramp (= shift) remains. This prevents a single bright row pixel
+    # from biasing the peak location.
     R  = np.fft.rfft(a) * np.conj(np.fft.rfft(b))
     R /= np.maximum(np.abs(R), 1e-12)
     c  = np.fft.irfft(R, n=n)
 
     k0 = int(np.argmax(c))
 
-    # Sub-pixel refinement: fit a parabola through the peak and its two neighbours
-    denom     = c[(k0 - 1) % n] - 2 * c[k0] + c[(k0 + 1) % n]
-    delta     = (0.5 * (c[(k0 - 1) % n] - c[(k0 + 1) % n]) / denom
-                 if abs(denom) > 1e-12 else 0.0)
-    shift_est = float(k0 + delta)
+    # Parabolic sub-sample refinement around the integer-shift peak
+    cm1, cp1 = c[(k0 - 1) % n], c[(k0 + 1) % n]
+    denom    = cm1 - 2 * c[k0] + cp1
+    delta    = 0.5 * (cm1 - cp1) / denom if abs(denom) > 1e-12 else 0.0
+    shift    = float(k0 + delta)
+    if shift > n / 2:
+        shift -= n   # unwrap from circular [0, n) to symmetric [-n/2, n/2)
 
-    # Wrap from the circular correlation range [0, n) to the symmetric range [-n/2, n/2)
-    if shift_est > n / 2:
-        shift_est -= n
-    shift_est = float(np.clip(shift_est, -max_shift, max_shift))
-
-    # Peak-to-Sidelobe Ratio: exclude ±5 samples around the peak from the background
+    # PSR: peak height in units of background σ, excluding ±N samples around
+    # the peak so the metric reflects true background, not the peak's skirt.
     mask = np.ones_like(c, dtype=bool)
-    lo, hi = (k0 - 5) % n, (k0 + 5) % n
+    lo, hi = (k0 - ALIGN_PSR_EXCLUDE_PX) % n, (k0 + ALIGN_PSR_EXCLUDE_PX) % n
     if lo <= hi:
         mask[lo:hi + 1] = False
     else:
         mask[:hi + 1] = False; mask[lo:] = False
 
-    std_bg = np.std(c[mask])
-    psr    = ((c[k0] - np.mean(c[mask])) / (std_bg + 1e-12)
-              if std_bg > 0 else 0.0)
+    bg     = c[mask]
+    std_bg = float(np.std(bg))
+    psr    = float((c[k0] - np.mean(bg)) / (std_bg + 1e-12)) if std_bg > 0 else 0.0
+    return shift, psr
 
-    # Accept the new estimate only if the correlation peak is strong and
-    # the shift doesn't jump unreasonably from the previous row
-    shift_use = (shift_est
-                 if (psr >= 6.0 and abs(shift_est - prev_shift) <= 1.8)
-                 else prev_shift)
 
-    # Apply fractional shift via phase ramp in the frequency domain (sinc interpolation)
-    k       = np.fft.rfftfreq(n)
-    row_out = np.fft.irfft(
-        np.fft.rfft(np.nan_to_num(row, nan=0.0)) * np.exp(-2j * np.pi * k * shift_use),
-        n=n,
-    )
-    return row_out.astype(np.float32), shift_use
+def align_row_minblur(row: np.ndarray, ref: np.ndarray,
+                      max_shift: float = ALIGN_MAX_SHIFT_PX,
+                      prev_shift: float = 0.0
+                      ) -> tuple[np.ndarray, float]:
+    """
+    Sub-pixel lateral alignment of a scan row against a reference row.
+
+    Background
+    ----------
+    In a bidi scan, LTR and RTL lines often have a systematic lateral offset
+    caused by belt backlash, motor inertia, and timing jitter. If left
+    uncorrected this produces a "comb" artefact in the image. This function
+    estimates the offset via phase-only cross-correlation, gates the estimate
+    against two confidence checks, and applies it to sub-pixel precision.
+
+    Confidence gates (both must pass for the new estimate to be accepted)
+    ---------------------------------------------------------------------
+    * PSR ≥ ``ALIGN_PSR_THRESHOLD``  — the correlation peak is statistically
+      above the sidelobe background.
+    * ``|shift − prev_shift| ≤ ALIGN_MAX_STEP_PX``  — the shift evolves
+      smoothly between adjacent rows of the same scan direction.
+
+    If either gate fails, ``prev_shift`` is reused (the row is still shifted,
+    but by the last trusted value rather than a noisy new estimate).
+
+    Parameters
+    ----------
+    row        : np.ndarray   Newly acquired row to align (float32, length ncols).
+    ref        : np.ndarray   Reference row for this scan direction (frozen at
+                              the first row by the caller).
+    max_shift  : float        Hard clip on the estimate, in image columns.
+    prev_shift : float        Last accepted shift for this scan direction.
+
+    Returns
+    -------
+    (aligned_row, shift_used) : tuple[np.ndarray, float]
+    """
+    if ref is None or not np.any(np.isfinite(ref)):
+        return row, 0.0
+
+    a = np.nan_to_num(row, nan=0.0); a -= np.mean(a)
+    b = np.nan_to_num(ref, nan=0.0); b -= np.mean(b)
+
+    shift_est, psr = _phase_corr_psr(a, b)
+    shift_est      = float(np.clip(shift_est, -max_shift, max_shift))
+
+    # Accept the new estimate only if the correlation peak is strong AND the
+    # shift doesn't jump unreasonably from the previous row of this direction
+    accept    = (psr >= ALIGN_PSR_THRESHOLD
+                 and abs(shift_est - prev_shift) <= ALIGN_MAX_STEP_PX)
+    shift_use = shift_est if accept else prev_shift
+
+    return apply_fractional_shift(row, shift_use), shift_use
 
 
 def apply_fractional_shift(row: np.ndarray, shift: float) -> np.ndarray:
@@ -666,7 +703,7 @@ class CScanService:
             requested_ch1_range = float(cfg.get("ch1_range", 1.0))
             hs = HS5StreamPeaks(
                 fs_hz=20_000_000,
-                gate_us=(35.0, 50.0),
+                gate_us=(25.0, 50.0),
                 ch1_range=requested_ch1_range,
                 feature_mode="envelope",
             ).open()
