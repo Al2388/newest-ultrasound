@@ -20,15 +20,17 @@ dependencies = [
     "python-libtiepie",
     "jinja2",
     "python-multipart",
-    "boxsdk[jwt]",
+    "box-sdk-gen",
     "h5py",
     "python-dotenv",
+    "opencv-python",
 ]
 
 [project.optional-dependencies]
 analysis = [
     "openpyxl",   # cycler XLSX
     "pandas",     # convenience for combined analysis
+    "scipy",      # robust fits and signal-processing helper scripts
 ]
 dev = [
     "pytest",

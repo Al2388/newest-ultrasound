@@ -171,6 +171,166 @@ def row_from_pulses_nosmooth(aa: np.ndarray, ncols: int,
     return out
 
 
+def auto_accel_for_speed(speed_mm_s: float,
+                         target_ramp_mm: float = 0.390625,
+                         min_accel_mm_s2: float = 250.0,
+                         max_accel_mm_s2: float = 1200.0,
+                         round_to_mm_s2: float = 50.0) -> float:
+    """
+    Pick a scan acceleration from scan speed.
+
+    The target is a short but not violent acceleration distance. The default
+    target matches the 25 mm/s : 800 mm/s^2 profile from scan 21-13-13:
+        d_acc = speed^2 / (2 * acceleration)
+
+    We keep d_acc near target_ramp_mm, then clamp to a practical Ender-stage
+    range so high-speed scans do not demand excessive jerk/water disturbance.
+    """
+    speed = max(0.0, float(speed_mm_s))
+    target = max(0.05, float(target_ramp_mm))
+    raw = speed * speed / (2.0 * target) if speed > 0 else min_accel_mm_s2
+    accel = float(np.clip(raw, min_accel_mm_s2, max_accel_mm_s2))
+    step = max(1.0, float(round_to_mm_s2))
+    return float(round(accel / step) * step)
+
+
+def resolve_scan_accel(cfg: dict) -> tuple[float, str]:
+    """Resolve manual vs speed-based automatic acceleration for a scan config."""
+    mode = str(cfg.get("accel_mode", "auto") or "auto").lower()
+    manual = cfg.get("accel_mm_s2")
+    if mode == "manual" and manual is not None and float(manual) > 0:
+        return float(manual), "manual"
+    return auto_accel_for_speed(float(cfg.get("speed", 25.0))), "auto_speed_based"
+
+
+def _motion_profile(distance_mm: float, speed_mm_s: float,
+                    accel_mm_s2: float) -> tuple[float, float, float, float, float]:
+    """Return accel/cruise/decel timing for a 1-D trapezoid move."""
+    distance = float(abs(distance_mm))
+    speed = float(abs(speed_mm_s))
+    accel = float(abs(accel_mm_s2))
+    if distance <= 0 or speed <= 0:
+        return 0.0, 0.0, 0.0, 0.0, distance
+    if accel <= 0:
+        total = distance / speed
+        return 0.0, total, 0.0, total, distance
+
+    t_acc = speed / accel
+    d_acc = 0.5 * accel * t_acc * t_acc
+    if 2.0 * d_acc >= distance:
+        t_acc = math.sqrt(distance / accel)
+        t_cruise = 0.0
+        v_peak = accel * t_acc
+        total = 2.0 * t_acc
+    else:
+        t_cruise = (distance - 2.0 * d_acc) / speed
+        v_peak = speed
+        total = 2.0 * t_acc + t_cruise
+    return t_acc, t_cruise, v_peak, total, distance
+
+
+def _motion_fraction(t_rel: np.ndarray, distance_mm: float, speed_mm_s: float,
+                     accel_mm_s2: float) -> tuple[np.ndarray, np.ndarray, float]:
+    """Map relative time to normalized distance [0, 1]."""
+    t_rel = np.asarray(t_rel, dtype=np.float64)
+    frac = np.full(t_rel.shape, np.nan, dtype=np.float64)
+    t_acc, t_cruise, v_peak, total, distance = _motion_profile(
+        distance_mm, speed_mm_s, accel_mm_s2
+    )
+    if total <= 0 or distance <= 0:
+        return frac, np.zeros(t_rel.shape, dtype=bool), total
+
+    in_motion = (t_rel >= 0.0) & (t_rel <= total)
+    if not np.any(in_motion):
+        return frac, in_motion, total
+
+    t = t_rel[in_motion]
+    s = np.empty_like(t)
+    if t_acc <= 0.0:
+        s[:] = v_peak * t
+    else:
+        accel = v_peak / t_acc
+        d_acc = 0.5 * accel * t_acc * t_acc
+        m_acc = t <= t_acc
+        m_cruise = (t > t_acc) & (t <= t_acc + t_cruise)
+        m_dec = t > t_acc + t_cruise
+        s[m_acc] = 0.5 * accel * t[m_acc] ** 2
+        s[m_cruise] = d_acc + v_peak * (t[m_cruise] - t_acc)
+        t_left = total - t[m_dec]
+        s[m_dec] = distance - 0.5 * accel * t_left ** 2
+
+    frac[in_motion] = np.clip(s / distance, 0.0, 1.0)
+    return frac, in_motion, total
+
+
+def motion_fraction_for_capture(timestamps: np.ndarray,
+                                capture_start_s: float,
+                                capture_end_s: float,
+                                distance_mm: float,
+                                speed_mm_s: float,
+                                accel_mm_s2: float) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Estimate physical scan fraction for each pulse timestamp."""
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    capture_duration = max(0.0, float(capture_end_s - capture_start_s))
+    _, _, _, profile_total_s, _ = _motion_profile(distance_mm, speed_mm_s, accel_mm_s2)
+    start_offset_s = max(0.0, 0.5 * (capture_duration - profile_total_s))
+    motion_start_s = float(capture_start_s) + start_offset_s
+    frac, in_motion, _ = _motion_fraction(
+        timestamps - motion_start_s, distance_mm, speed_mm_s, accel_mm_s2
+    )
+    return frac, in_motion, motion_start_s, profile_total_s
+
+
+def row_from_pulses_motion(values: np.ndarray,
+                           timestamps: np.ndarray,
+                           ncols: int,
+                           capture_start_s: float,
+                           capture_end_s: float,
+                           distance_mm: float,
+                           speed_mm_s: float,
+                           accel_mm_s2: float,
+                           reverse: bool = False) -> np.ndarray:
+    """Bin pulse features onto X columns using the modeled stage motion."""
+    out = np.full(ncols, np.nan, dtype=np.float32)
+    if ncols <= 0 or values.size == 0:
+        return out
+
+    frac, in_motion, _, _ = motion_fraction_for_capture(
+        timestamps, capture_start_s, capture_end_s, distance_mm, speed_mm_s, accel_mm_s2
+    )
+    values = np.asarray(values, dtype=np.float64)
+    valid = in_motion & np.isfinite(frac) & np.isfinite(values)
+    if not np.any(valid):
+        return out
+
+    x_frac = 1.0 - frac[valid] if reverse else frac[valid]
+    x = x_frac * (ncols - 1)
+    i0 = np.floor(x).astype(np.int64)
+    i1 = np.clip(i0 + 1, 0, ncols - 1)
+    w1 = x - i0
+    w0 = 1.0 - w1
+
+    acc = np.zeros(ncols, dtype=np.float64)
+    sumw = np.zeros(ncols, dtype=np.float64)
+    v = values[valid]
+    np.add.at(acc, i0, w0 * v)
+    np.add.at(sumw, i0, w0)
+    np.add.at(acc, i1, w1 * v)
+    np.add.at(sumw, i1, w1)
+
+    filled = sumw > 1e-12
+    out[filled] = (acc[filled] / sumw[filled]).astype(np.float32)
+
+    good = np.flatnonzero(np.isfinite(out))
+    if good.size >= 2:
+        lo, hi = int(good[0]), int(good[-1])
+        idx = np.arange(lo, hi + 1)
+        missing = ~np.isfinite(out[idx])
+        if np.any(missing):
+            out[idx[missing]] = np.interp(idx[missing], good, out[good]).astype(np.float32)
+    return out
+
+
 def _phase_corr_psr(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     """
     Phase-only cross-correlation between two equal-length 1-D signals.
@@ -332,7 +492,7 @@ class CScanService:
     both of which acquire self._lock for a brief critical section.
     """
 
-    def __init__(self):
+    def __init__(self, temperature_service=None):
         self._lock       = threading.Lock()
         self._stop_event = threading.Event()
         self.running     = False
@@ -345,9 +505,12 @@ class CScanService:
         self.config = {
             "com_port":       "COM6",        # serial port for the Ender
             "roi_w":          80.0,          # scan region width  (mm)
-            "roi_h":          70.0,          # scan region height (mm)
-            "pitch":          0.1,           # line spacing (mm) — nlines = roi_h / pitch
-            "speed":          10.0,          # scan speed (mm/s)
+            "roi_h":          72.0,          # scan region height (mm)
+            "pitch":          0.5,           # line spacing (mm) — nlines = roi_h / pitch
+            "speed":          25.0,          # scan speed (mm/s)
+            "accel_mode":     "auto",        # auto = choose acceleration from speed
+            "accel_mm_s2":    800.0,         # resolved Marlin M204 acceleration
+            "accel_source":   "auto_speed_based",
             "ch1_range":      5.0,           # CH1 voltage range (V) — fixed; sized for typical ±4 V echoes
             "cols":           500,           # output image width in pixels
             "scan_name":      "",            # label for the run folder
@@ -359,6 +522,7 @@ class CScanService:
         self._session_id = None
         self._session_dir = None
         self._session_ts = None        # YYYY-MM-DD_HH-MM-SS string set at start_scan()
+        self.temperature_service = temperature_service
         self.cloud = CloudManager()
 
     # -------------------------------------------------------------------------
@@ -420,6 +584,9 @@ class CScanService:
             return False, "Already Running"
         if new_config:
             self.config.update(new_config)
+        resolved_accel, accel_source = resolve_scan_accel(self.config)
+        self.config["accel_mm_s2"] = resolved_accel
+        self.config["accel_source"] = accel_source
 
         ts = session_timestamp()
         name = _safe_session_name(self.config.get("scan_name", ""), "scan")
@@ -467,6 +634,7 @@ class CScanService:
             pr, _, _, _, _ = setup_precision_printer(
                 self.config["com_port"], 115200,
                 self.config["roi_w"], self.config["roi_h"],
+                accel_mm_s2=float(self.config.get("accel_mm_s2", 500.0)),
                 reset_origin=False,   # don't redefine the origin — just move to it
             )
             pr.move_to_position(0.0, 0.0, fast=True)
@@ -492,7 +660,10 @@ class CScanService:
 
     def _save_line(self, line_idx: int, y_mm: float, ltr: bool,
                    tt, aa, tf, ee, wf, x_mm,
-                   fs_hz: float, g0_samp: int, g1_samp: int):
+                   fs_hz: float, g0_samp: int, g1_samp: int,
+                   line_start_perf_s: float, line_end_perf_s: float,
+                   wall_clock_offset_s: float,
+                   temperature_stats: dict | None = None):
         """
         Archive all raw pulse data for one scan line as a compressed NPZ file.
 
@@ -505,7 +676,9 @@ class CScanService:
         amplitude  [n_pulses]                float32  envelope peak (V)
         tof_us     [n_pulses]                float32  time-of-flight within gate (µs)
         energy     [n_pulses]                float32  pulse energy (V²·samples)
-        timestamps [n_pulses]                float64  perf_counter wall-clock time
+        timestamps [n_pulses]                float64  perf_counter time
+        pulse_unix_s [n_pulses]              float64  Unix wall-clock time
+        line_unix_start_s/end_s/center_s     float64  line wall-clock window
         x_mm       [n_pulses]                float32  estimated probe X position (mm)
         y_mm       scalar                    float32  scan line Y position (mm)
         direction  scalar uint8              0=LTR, 1=RTL
@@ -516,11 +689,25 @@ class CScanService:
         os.makedirs(lines_dir, exist_ok=True)
         path = os.path.join(lines_dir, f"line_{line_idx:04d}.npz")
 
+        line_unix_start_s = line_start_perf_s + wall_clock_offset_s
+        line_unix_end_s   = line_end_perf_s + wall_clock_offset_s
+        temperature_stats = temperature_stats or {}
+
         arrays = dict(
             amplitude  = aa,
             tof_us     = tf,
             energy     = ee,
             timestamps = tt,
+            pulse_unix_s = tt + wall_clock_offset_s,
+            line_perf_start_s  = np.float64(line_start_perf_s),
+            line_perf_end_s    = np.float64(line_end_perf_s),
+            line_unix_start_s  = np.float64(line_unix_start_s),
+            line_unix_end_s    = np.float64(line_unix_end_s),
+            line_unix_center_s = np.float64(0.5 * (line_unix_start_s + line_unix_end_s)),
+            temperature_mean_c = np.float64(temperature_stats.get("temperature_mean_c", np.nan)),
+            temperature_min_c  = np.float64(temperature_stats.get("temperature_min_c", np.nan)),
+            temperature_max_c  = np.float64(temperature_stats.get("temperature_max_c", np.nan)),
+            n_temperature_samples = np.int32(temperature_stats.get("n_temperature_samples", 0)),
             x_mm       = x_mm,
             y_mm       = np.float32(y_mm),
             direction  = np.uint8(0 if ltr else 1),
@@ -540,7 +727,8 @@ class CScanService:
     # -------------------------------------------------------------------------
 
     def _save_final_npz(self, amp_arr: np.ndarray, tof_arr: np.ndarray,
-                        eng_arr: np.ndarray, hs_info: dict):
+                        eng_arr: np.ndarray, hs_info: dict,
+                        line_timing: dict | None = None):
         """
         Save the completed scan as scan_<YYYY-MM-DD_HH-MM-SS>.npz + scan_<YYYY-MM-DD_HH-MM-SS>_meta.json.
 
@@ -569,14 +757,16 @@ class CScanService:
         npz_path   = os.path.join(cfg["out_dir"], npz_name)
         meta_path  = os.path.join(cfg["out_dir"], meta_name)
 
-        np.savez_compressed(
-            npz_path,
+        scan_arrays = dict(
             amplitude = amp_arr,
             tof       = tof_arr,
             energy    = eng_arr,
             x_mm      = np.linspace(0, cfg["roi_w"], cols, dtype=np.float32),
             y_mm      = np.linspace(0, cfg["roi_h"], rows, dtype=np.float32),
         )
+        if line_timing:
+            scan_arrays.update(line_timing)
+        np.savez_compressed(npz_path, **scan_arrays)
 
         meta = {
             "scan_id":           f"scan_{ts}",
@@ -597,11 +787,16 @@ class CScanService:
             "roi_h_mm":          cfg["roi_h"],
             "pitch_mm":          cfg["pitch"],
             "speed_mm_s":        cfg["speed"],
+            "accel_mm_s2":       cfg.get("accel_mm_s2", 500.0),
+            "accel_mode":        cfg.get("accel_mode", "auto"),
+            "accel_source":      cfg.get("accel_source", "manual"),
+            "x_motion_model":     "trapezoid_centered_in_capture",
             "nlines":            rows,
             "ncols":             cols,
             "save_waveforms":    cfg.get("save_waveforms", True),
             "feature_map_file":  npz_name,
             "line_files_dir":    "lines_raw/",
+            "line_timing_fields": sorted(line_timing.keys()) if line_timing else [],
         }
         with open(meta_path, "w") as f:
             json.dump(_json_safe(meta), f, indent=2)
@@ -695,10 +890,25 @@ class CScanService:
         img_tof = np.full((nlines, cfg["cols"]), np.nan, dtype=np.float32)
         img_eng = np.full((nlines, cfg["cols"]), np.nan, dtype=np.float32)
 
+        # Per-row timing lets PicoLog samples be matched by overlap with each
+        # C-scan line window, then averaged when multiple temperature points fall
+        # inside the same line.
+        line_perf_start_s = np.full(nlines, np.nan, dtype=np.float64)
+        line_perf_end_s   = np.full(nlines, np.nan, dtype=np.float64)
+        line_unix_start_s = np.full(nlines, np.nan, dtype=np.float64)
+        line_unix_end_s   = np.full(nlines, np.nan, dtype=np.float64)
+        line_unix_center_s = np.full(nlines, np.nan, dtype=np.float64)
+        line_pulse_count  = np.zeros(nlines, dtype=np.int32)
+        line_temperature_mean_c = np.full(nlines, np.nan, dtype=np.float64)
+        line_temperature_min_c = np.full(nlines, np.nan, dtype=np.float64)
+        line_temperature_max_c = np.full(nlines, np.nan, dtype=np.float64)
+        line_temperature_n = np.zeros(nlines, dtype=np.int32)
+
         pr, hs = None, None
         try:
             pr, xl, xr, ys, _ = setup_precision_printer(
-                cfg["com_port"], 115200, cfg["roi_w"], cfg["roi_h"], reset_origin=True
+                cfg["com_port"], 115200, cfg["roi_w"], cfg["roi_h"],
+                reset_origin=True, accel_mm_s2=float(cfg.get("accel_mm_s2", 500.0)),
             )
             requested_ch1_range = float(cfg.get("ch1_range", 1.0))
             hs = HS5StreamPeaks(
@@ -713,6 +923,7 @@ class CScanService:
             detected_prf   = getattr(hs, "detected_prf", 5000.0) or 5000.0
             expected_cycles = int(detected_prf * theo_time)        # expected pulses/line
             save_wf        = cfg.get("save_waveforms", True)
+            wall_clock_offset_s = time.time() - time.perf_counter()
 
             # Separate rolling alignment references for LTR and RTL lines.
             # Using per-direction references prevents a spatially-reversed RTL row
@@ -747,34 +958,62 @@ class CScanService:
                 pr.wait_for_completion()
                 t1 = time.perf_counter()
 
+                line_perf_start_s[i] = t0
+                line_perf_end_s[i] = t1
+                line_unix_start_s[i] = t0 + wall_clock_offset_s
+                line_unix_end_s[i] = t1 + wall_clock_offset_s
+                line_unix_center_s[i] = 0.5 * (line_unix_start_s[i] + line_unix_end_s[i])
+                if self.temperature_service is not None:
+                    temp_stats = self.temperature_service.stats_between(
+                        float(line_unix_start_s[i]),
+                        float(line_unix_end_s[i]),
+                    )
+                    line_temperature_mean_c[i] = temp_stats["temperature_mean_c"]
+                    line_temperature_min_c[i] = temp_stats["temperature_min_c"]
+                    line_temperature_max_c[i] = temp_stats["temperature_max_c"]
+                    line_temperature_n[i] = temp_stats["n_temperature_samples"]
+                else:
+                    temp_stats = None
+
                 # Lenient ±50 ms slack on the time-window crop — guards against
                 # perf_counter / printer wall-clock skew at line boundaries.
                 sel  = (tt >= t0 - 0.05) & (tt <= t1 + 0.05)
                 tt_s = tt[sel]
                 aa_s, tf_s, ee_s = aa[sel], tf[sel], ee[sel]
                 wf_s = wf[sel] if wf is not None else None
+                line_pulse_count[i] = int(tt_s.size)
 
-                # Estimate physical X position of each pulse via linear interpolation.
-                # The probe moves from x0 to x1 in theo_time seconds; each pulse's
-                # timestamp maps to a fractional position along that line.
-                t_rel = tt_s - t0
-                x_pos = (x0 + (x1 - x0) *
-                         np.clip(t_rel / theo_time, 0.0, 1.0)).astype(np.float32)
+                # Estimate physical X position from a speed/acceleration motion
+                # profile centered in the captured pulse window.
+                line_distance = abs(x1 - x0)
+                accel_mm_s2 = float(cfg.get("accel_mm_s2", 500.0))
+                x_frac, in_motion, _, profile_time = motion_fraction_for_capture(
+                    tt_s, t0, t1, line_distance, cfg["speed"], accel_mm_s2
+                )
+                x_pos = (x0 + (x1 - x0) * x_frac).astype(np.float32)
 
                 # Archive raw line data (in natural acquisition order, real x positions)
                 self._save_line(
                     i, y, ltr, tt_s, aa_s, tf_s, ee_s, wf_s, x_pos,
                     hs.fs, hs.g0, hs.g1,
+                    t0, t1, wall_clock_offset_s, temp_stats,
                 )
 
-                # Reverse RTL lines so the image grid is always left-to-right
-                if not ltr:
-                    aa_s, tf_s, ee_s = aa_s[::-1], tf_s[::-1], ee_s[::-1]
-
-                # Resample variable-count pulse arrays onto the fixed image grid
-                ra = row_from_pulses_nosmooth(aa_s, cfg["cols"], expected_cycles)
-                rf = row_from_pulses_nosmooth(tf_s, cfg["cols"], expected_cycles)
-                re = row_from_pulses_nosmooth(ee_s, cfg["cols"], expected_cycles)
+                # Resample pulse arrays onto the fixed image grid using the
+                # modeled physical X position, not just pulse order.
+                reverse = not ltr
+                ra = row_from_pulses_motion(
+                    aa_s, tt_s, cfg["cols"], t0, t1, line_distance,
+                    cfg["speed"], accel_mm_s2, reverse=reverse,
+                )
+                rf = row_from_pulses_motion(
+                    tf_s, tt_s, cfg["cols"], t0, t1, line_distance,
+                    cfg["speed"], accel_mm_s2, reverse=reverse,
+                )
+                re = row_from_pulses_motion(
+                    ee_s, tt_s, cfg["cols"], t0, t1, line_distance,
+                    cfg["speed"], accel_mm_s2, reverse=reverse,
+                )
 
                 # Align each row to the first row in the same scan direction.
                 # Reference is frozen at line 0 (per direction) so per-row alignment
@@ -818,7 +1057,19 @@ class CScanService:
                 "ch1_range_actual_v":    float(getattr(hs, "range", requested_ch1_range)),
                 "partial":           stopped,
             }
-            self._save_final_npz(img_amp, img_tof, img_eng, hs_info)
+            line_timing = {
+                "line_perf_start_s": line_perf_start_s,
+                "line_perf_end_s": line_perf_end_s,
+                "line_unix_start_s": line_unix_start_s,
+                "line_unix_end_s": line_unix_end_s,
+                "line_unix_center_s": line_unix_center_s,
+                "line_pulse_count": line_pulse_count,
+                "line_temperature_mean_c": line_temperature_mean_c,
+                "line_temperature_min_c": line_temperature_min_c,
+                "line_temperature_max_c": line_temperature_max_c,
+                "line_temperature_n": line_temperature_n,
+            }
+            self._save_final_npz(img_amp, img_tof, img_eng, hs_info, line_timing=line_timing)
 
             if stopped:
                 self._set(status="STOPPED", progress={"msg": "Scan stopped; partial data saved."})

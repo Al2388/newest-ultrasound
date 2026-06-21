@@ -71,7 +71,7 @@
             margin-top: 10px;
             color: #cbd5e1;
         }
-        input[type=number], input[type=text] {
+        input[type=number], input[type=text], select {
             width: 100%;
             background: transparent;
             border: none;
@@ -83,6 +83,7 @@
             font-weight: 300;
             margin-top: 2px;
         }
+        select option { color: var(--ink); background: white; }
         input:focus { outline: none; border-bottom-color: var(--primary); }
 
         button {
@@ -237,6 +238,73 @@
         .ann-soc { font-weight: 500; color: var(--primary); min-width: 50px; }
         .ann-label { color: var(--ink); flex: 1; }
         .ann-time { color: var(--muted); white-space: nowrap; }
+
+        /* --------------------------------------------------- persistent overlay */
+        .pip {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            width: 280px;
+            background: rgba(15, 17, 22, 0.92);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 10px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            z-index: 9999;
+            overflow: hidden;
+            color: #f4f6f9;
+            font-size: 0.78rem;
+            user-select: none;
+        }
+        .pip-h {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 10px;
+            background: rgba(0,0,0,0.4);
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            font-size: 0.7rem;
+            color: #d2d6dd;
+        }
+        .pip-h-actions button {
+            background: transparent;
+            border: 1px solid rgba(255,255,255,0.25);
+            color: inherit;
+            padding: 1px 7px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.72rem;
+        }
+        .pip-h-actions button:hover { background: rgba(255,255,255,0.1); }
+        .pip-body img {
+            display: block;
+            width: 100%;
+            height: auto;
+            background: #000;
+        }
+        .pip-temp {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            padding: 8px 12px 10px;
+            border-top: 1px solid rgba(255,255,255,0.08);
+        }
+        .pip-temp .v {
+            font-size: 1.15rem;
+            font-weight: 500;
+            font-variant-numeric: tabular-nums;
+        }
+        .pip-temp .l {
+            font-size: 0.68rem;
+            color: #9ba3ad;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .pip.collapsed .pip-body, .pip.collapsed .pip-temp { display: none; }
+        @media (max-width: 600px) {
+            .pip { width: 200px; right: 8px; bottom: 8px; }
+        }
     </style>
 </head>
 <body>
@@ -251,9 +319,15 @@
             <h3>C-Scan</h3>
             <label>Scan name</label>       <input type="text" id="scan_name" placeholder="e.g. cell_A1_baseline">
             <label>ROI Width  (mm)</label>  <input type="number" id="roi_w" value="80.0">
-            <label>ROI Height (mm)</label>  <input type="number" id="roi_h" value="70.0">
-            <label>Resolution (mm)</label>  <input type="number" id="pitch" value="0.1">
-            <label>Speed (mm/s)</label>     <input type="number" id="speed" value="10.0">
+            <label>ROI Height (mm)</label>  <input type="number" id="roi_h" value="72.0">
+            <label>Resolution (mm)</label>  <input type="number" id="pitch" value="0.5">
+            <label>Speed (mm/s)</label>     <input type="number" id="speed" value="25.0">
+            <label>Acceleration mode</label>
+            <select id="accel_mode" onchange="updateAccelMode()">
+                <option value="auto" selected>Auto from speed</option>
+                <option value="manual">Manual</option>
+            </select>
+            <label>Manual acceleration (mm/s²)</label><input type="number" id="accel_mm_s2" value="800" step="50" min="1">
         </div>
         <div class="group">
             <h3>Sampling (fixed)</h3>
@@ -344,6 +418,34 @@
         </div>
     </div>
 
+    <!-- Temperature controls -->
+    <div id="sb-temp" style="display:none">
+        <div class="group">
+            <h3>USB TC-08</h3>
+            <label>Session name</label>
+            <input type="text" id="temp_name" placeholder="e.g. cscan_temp_run">
+            <label>Interval (s)</label>
+            <input type="number" id="temp_interval" value="0.1" min="0.1" step="0.1">
+            <label>Thermocouple type</label>
+            <select id="temp_tc_type">
+                <option value="T" selected>T</option>
+                <option value="K">K</option>
+                <option value="J">J</option>
+                <option value="N">N</option>
+                <option value="R">R</option>
+                <option value="S">S</option>
+                <option value="B">B</option>
+                <option value="E">E</option>
+            </select>
+            <label>Channels</label>
+            <input type="text" id="temp_channels" value="1" placeholder="e.g. 1 or 1,2,3">
+        </div>
+        <div class="group">
+            <button class="btn-start" onclick="startTemp()">Start Logging</button>
+            <button class="btn-stop"  onclick="stopTemp()">Stop</button>
+        </div>
+    </div>
+
     <div class="footer">
         Lab system · v2.5<br>
         Cloud archive: AWS S3
@@ -358,6 +460,8 @@
         <button class="tab-btn active" id="tab-btn-cscan" onclick="switchTab('cscan')">C-Scan</button>
         <button class="tab-btn"        id="tab-btn-ascan" onclick="switchTab('ascan')">A-Scan</button>
         <button class="tab-btn"        id="tab-btn-gauge" onclick="switchTab('gauge')">Gauging</button>
+        <button class="tab-btn"        id="tab-btn-temp"  onclick="switchTab('temp')">Temperature</button>
+        <button class="tab-btn"        id="tab-btn-camera" onclick="switchTab('camera')">Camera</button>
     </div>
 
     <!-- ======================= C-SCAN TAB ======================= -->
@@ -481,6 +585,65 @@
         </div>
     </section>
 
+    <!-- ======================= TEMPERATURE TAB ======================= -->
+    <section class="content" id="tab-temp" style="display:none">
+        <div class="status-bar">
+            <div>
+                <h2>Temperature</h2>
+                <div class="sub" id="temp-msg">USB TC-08 idle</div>
+            </div>
+            <div style="text-align:right">
+                <span id="temp-badge" class="badge">idle</span>
+                <div class="sub" style="margin-top:6px">
+                    <span id="temp-n">0</span> samples
+                </div>
+            </div>
+        </div>
+
+        <div class="grid" style="grid-template-columns: 1fr 1fr">
+            <div class="card">
+                <div class="card-h">Latest reading</div>
+                <div class="tof-readout">
+                    <div>
+                        <span class="num" id="temp-latest">â€”</span><span class="unit"> Â°C</span>
+                    </div>
+                    <div class="meta" id="temp-channels-label">channels â€”</div>
+                    <div class="meta" id="temp-file" style="margin-top:8px;font-size:0.78rem"></div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-h">Channel temperatures</div>
+                <div style="padding:16px; font-variant-numeric: tabular-nums; line-height:1.9" id="temp-channel-list">
+                    No data yet.
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="content" id="tab-camera" style="display:none">
+        <div class="status-bar">
+            <div>
+                <h2>Camera</h2>
+                <div class="sub" id="camera-msg">Live view of the scan rig.</div>
+            </div>
+            <div style="text-align:right">
+                <span id="camera-badge" class="badge">idle</span>
+                <div class="sub" style="margin-top:6px">
+                    <span id="camera-res">—</span> · <span id="camera-frames">0</span> frames
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-h">Live stream</div>
+            <div style="padding:16px; display:flex; justify-content:center; background:#000">
+                <img id="camera-img" alt="camera offline"
+                     style="max-width:100%; max-height:70vh; display:block"
+                     src="" />
+            </div>
+        </div>
+    </section>
+
 </main>
 
 <script>
@@ -488,25 +651,68 @@ const API_KEY = "{{ api_key }}";
 
 // ---- tab switching ----------------------------------------------------------
 function switchTab(tab) {
-    ['cscan','ascan','gauge'].forEach(t => {
+    ['cscan','ascan','gauge','temp','camera'].forEach(t => {
         document.getElementById('tab-' + t).style.display     = t === tab ? '' : 'none';
         document.getElementById('tab-btn-' + t).classList.toggle('active', t === tab);
     });
     document.getElementById('sb-cscan').style.display = tab === 'cscan' ? '' : 'none';
     document.getElementById('sb-ascan').style.display = tab === 'ascan' ? '' : 'none';
     document.getElementById('sb-gauge').style.display = tab === 'gauge' ? '' : 'none';
+    document.getElementById('sb-temp').style.display  = tab === 'temp'  ? '' : 'none';
+
+    // Camera: only attach the <img> src while the tab is visible so the
+    // capture worker shuts down when nobody is watching.
+    const img = document.getElementById('camera-img');
+    if (tab === 'camera') {
+        img.src = '/api/camera/stream?t=' + Date.now();
+    } else if (img.src) {
+        img.src = '';
+    }
 }
 
 // ---- generic API call -------------------------------------------------------
+function _messageElForEndpoint(endpoint) {
+    if (endpoint.startsWith('/api/gauge/')) return document.getElementById('gauge-msg');
+    if (endpoint.startsWith('/api/temp/'))  return document.getElementById('temp-msg');
+    if (endpoint.startsWith('/api/ascan/')) return document.getElementById('ascan-msg');
+    return document.getElementById('status-msg');
+}
+
+function _showApiIssue(endpoint, message) {
+    const text = message || 'Request failed';
+    const el = _messageElForEndpoint(endpoint);
+    if (el) el.innerText = text;
+    console.error(text);
+    alert(text);
+}
+
 async function apiCall(endpoint, body=null) {
     try {
         const opts = { method:'POST', headers:{'Content-Type':'application/json','X-API-Key':API_KEY} };
         if (body) opts.body = JSON.stringify(body);
         const res  = await fetch(endpoint, opts);
-        const data = await res.json();
-        if (!res.ok) console.error(data.detail || data.msg);
+        const raw = await res.text();
+        let data = {};
+        if (raw) {
+            try {
+                data = JSON.parse(raw);
+            } catch(e) {
+                data = { msg: raw };
+            }
+        }
+        if (!res.ok) {
+            const detail = data.detail || data.msg || `HTTP ${res.status}`;
+            _showApiIssue(endpoint, detail);
+            return null;
+        }
+        if (data && data.success === false) {
+            _showApiIssue(endpoint, data.msg || 'Request did not complete.');
+        }
         return data;
-    } catch(e) { console.error(e); return null; }
+    } catch(e) {
+        _showApiIssue(endpoint, e.message || String(e));
+        return null;
+    }
 }
 
 async function downloadProtected(endpoint) {
@@ -538,6 +744,11 @@ function setBadge(el, status, runningClass) {
 }
 
 // ---- C-Scan -----------------------------------------------------------------
+function updateAccelMode() {
+    const mode = document.getElementById('accel_mode').value;
+    document.getElementById('accel_mm_s2').disabled = mode === 'auto';
+}
+
 function startScan() {
     apiCall('/api/start', {
         scan_name: document.getElementById('scan_name').value,
@@ -545,10 +756,13 @@ function startScan() {
         roi_h: parseFloat(document.getElementById('roi_h').value),
         pitch: parseFloat(document.getElementById('pitch').value),
         speed: parseFloat(document.getElementById('speed').value),
+        accel_mode: document.getElementById('accel_mode').value,
+        accel_mm_s2: parseFloat(document.getElementById('accel_mm_s2').value),
     });
 }
 function stopScan()      { apiCall('/api/stop'); }
 function returnToStart() { apiCall('/api/return'); }
+updateAccelMode();
 
 setInterval(async () => {
     try {
@@ -792,15 +1006,25 @@ setInterval(async () => {
 }, 1000);
 
 // ---- Gauging (live ToF + HDF5 archival) ------------------------------------
-function startGauge() {
-    apiCall('/api/gauge/start', {
+async function startGauge() {
+    document.getElementById('gauge-msg').innerText = 'Starting gauging...';
+    const data = await apiCall('/api/gauge/start', {
         session_name:  document.getElementById('gauge_name').value,
         gate_us_start: parseFloat(document.getElementById('gauge_gate_start').value),
         gate_us_end:   parseFloat(document.getElementById('gauge_gate_end').value),
         ch1_range:     parseFloat(document.getElementById('gauge_ch1_range').value),
     });
+    if (data && data.msg) {
+        document.getElementById('gauge-msg').innerText = data.msg;
+    }
 }
-function stopGauge() { apiCall('/api/gauge/stop'); }
+async function stopGauge() {
+    document.getElementById('gauge-msg').innerText = 'Stopping gauging...';
+    const data = await apiCall('/api/gauge/stop');
+    if (data && data.msg) {
+        document.getElementById('gauge-msg').innerText = data.msg;
+    }
+}
 
 setInterval(async () => {
     try {
@@ -846,6 +1070,115 @@ setInterval(async () => {
         );
     } catch(e) {}
 }, 1000);
+
+// ---- Temperature (USB TC-08) ------------------------------------------------
+function _parseChannels(text) {
+    return (text || '1').split(',')
+        .map(s => parseInt(s.trim(), 10))
+        .filter(n => Number.isFinite(n) && n >= 1 && n <= 8);
+}
+
+async function startTemp() {
+    document.getElementById('temp-msg').innerText = 'Starting USB TC-08 logger...';
+    const data = await apiCall('/api/temp/start', {
+        session_name: document.getElementById('temp_name').value,
+        interval_s: parseFloat(document.getElementById('temp_interval').value),
+        thermocouple_type: document.getElementById('temp_tc_type').value,
+        channels: _parseChannels(document.getElementById('temp_channels').value),
+    });
+    if (data && data.msg) {
+        document.getElementById('temp-msg').innerText = data.msg;
+    }
+}
+async function stopTemp() {
+    document.getElementById('temp-msg').innerText = 'Stopping USB TC-08 logger...';
+    const data = await apiCall('/api/temp/stop');
+    if (data && data.msg) {
+        document.getElementById('temp-msg').innerText = data.msg;
+    }
+    await pollTempStatus();
+}
+
+async function pollTempStatus() {
+    try {
+        const data = await fetch('/api/temp/status').then(r => r.json());
+        document.getElementById('temp-msg').innerText = data.progress?.msg || data.status || 'Idle';
+        document.getElementById('temp-n').innerText = data.progress?.n_samples || 0;
+        setBadge(
+            document.getElementById('temp-badge'),
+            data.status,
+            data.running && data.status === 'LOGGING' ? 'rec' : ''
+        );
+
+        const latest = data.latest;
+        if (latest && latest.temperature_mean_c != null) {
+            document.getElementById('temp-latest').innerText =
+                Number(latest.temperature_mean_c).toFixed(3);
+            const channels = latest.channels_c || {};
+            document.getElementById('temp-channels-label').innerText =
+                'channels ' + Object.keys(channels).join(', ');
+            document.getElementById('temp-channel-list').innerHTML =
+                Object.entries(channels).map(([ch, val]) =>
+                    `<div>CH${ch}: <strong>${Number(val).toFixed(3)} Â°C</strong></div>`
+                ).join('');
+        } else {
+            document.getElementById('temp-latest').innerText = 'â€”';
+            document.getElementById('temp-channels-label').innerText = 'channels â€”';
+            document.getElementById('temp-channel-list').innerText = 'No data yet.';
+        }
+        document.getElementById('temp-file').innerText =
+            data.file ? 'archive: ' + data.file : '';
+
+        // Mirror latest temperature into the persistent overlay too.
+        const pipTemp = document.getElementById('pip-temp-v');
+        const pipLabel = document.getElementById('pip-temp-l');
+        if (latest && latest.temperature_mean_c != null) {
+            pipTemp.innerText = Number(latest.temperature_mean_c).toFixed(2) + ' °C';
+            const channels = latest.channels_c || {};
+            const chNames = Object.keys(channels);
+            pipLabel.innerText = chNames.length > 1
+                ? `TC-08 (${chNames.length} ch, mean)`
+                : `TC-08 CH${chNames[0] || '?'}`;
+        } else {
+            pipTemp.innerText = '—';
+            pipLabel.innerText = data.running ? 'TC-08 starting…' : 'TC-08 idle';
+        }
+    } catch(e) {}
+}
+setInterval(pollTempStatus, 1000);
+
+// ---- persistent overlay (camera + temperature) ------------------------------
+function togglePip() {
+    document.getElementById('pip').classList.toggle('collapsed');
+}
+// Attach the camera stream once the overlay DOM exists. document.readyState
+// is "loading" while body is still parsing — the DOMContentLoaded fallback
+// handles that case; otherwise just run immediately.
+function initPip() {
+    const img = document.getElementById('pip-cam');
+    if (img) img.src = '/api/camera/stream?pip=' + Date.now();
+}
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initPip);
+} else {
+    initPip();
+}
 </script>
+
+<div class="pip" id="pip">
+    <div class="pip-h">
+        <span>Live · camera + temp</span>
+        <span class="pip-h-actions">
+            <button onclick="togglePip()" title="show/hide">_</button>
+        </span>
+    </div>
+    <div class="pip-body">
+        <img id="pip-cam" alt="camera" src="" />
+    </div>
+    <div class="pip-temp">
+        <span class="l" id="pip-temp-l">TC-08 idle</span>
+        <span class="v" id="pip-temp-v">—</span>
+    </div>
+</div>
 </body>
 </html>

@@ -92,7 +92,7 @@ class CloudManager:
 
         if not _HAS_BOXSDK:
             print("[CLOUD] Disabled: Box SDK not installed. "
-                  "Run `pip install boxsdk` to enable.")
+                  "Run `pip install box-sdk-gen` to enable.")
             return
 
         dev_token = os.getenv("BOX_DEV_TOKEN")

@@ -1,0 +1,32 @@
+{
+  "source_report_dir": "reports\\experiments\\baseline_repeat_6scan_2026-05-28_startpoint",
+  "output_dir": "reports\\experiments\\baseline_repeat_6scan_2026-05-28_startpoint\\report_ready_figures_tables",
+  "n_scans": 6,
+  "baseline_scan_id": "scan_2026-05-28_18-52-24",
+  "figures": [
+    "fig01_temperature_stability.png",
+    "fig02_roi_definition_on_baseline.png",
+    "fig03_noise_floor_span_maps.png",
+    "fig04_repeatability_sigma_maps.png",
+    "fig05_pixel_noise_sigma_distributions.png",
+    "fig06_roi_mean_repeatability.png",
+    "fig07_battery_focused_roi.png"
+  ],
+  "tables": [
+    "table01_scan_conditions.csv",
+    "table01_scan_conditions.md",
+    "table01_scan_conditions.tex",
+    "table02_roi_definition.csv",
+    "table02_roi_definition.md",
+    "table02_roi_definition.tex",
+    "table03_noise_floor_by_roi.csv",
+    "table03_noise_floor_by_roi.md",
+    "table03_noise_floor_by_roi.tex",
+    "table04_model_noise_terms.csv",
+    "table04_model_noise_terms.md",
+    "table04_model_noise_terms.tex",
+    "table05_battery_focused_noise_terms.csv",
+    "table05_battery_focused_noise_terms.md",
+    "table05_battery_focused_noise_terms.tex"
+  ]
+}
