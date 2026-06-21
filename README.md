@@ -5,6 +5,15 @@ A FastAPI web server orchestrates three acquisition modes against shared
 hardware (a TiePie HS5 oscilloscope and a modified Ender 3D printer mounting
 the transducer):
 
+## C-scan handoff
+
+If you are taking over the lab rig, start here:
+
+- [Operator checklist](docs/CSCAN_OPERATOR_CHECKLIST.md) - bench-side steps for running a scan.
+- [C-scan handoff](docs/CSCAN_HANDOFF.md) - hardware, software, data schema, batch runs, analysis assumptions, and gotchas.
+- [Project map](docs/PROJECT_MAP.md) - where the acquisition code, scripts, and thesis outputs live.
+- [GitHub repository scope](docs/GITHUB_REPOSITORY_SCOPE.md) - what to commit, what to show, and what to keep out of git.
+
 | Mode    | What it does                                                      | Output                      |
 |---------|-------------------------------------------------------------------|-----------------------------|
 | C-scan  | 2-D raster scan over the cell surface                             | Amplitude / ToF / Energy maps |

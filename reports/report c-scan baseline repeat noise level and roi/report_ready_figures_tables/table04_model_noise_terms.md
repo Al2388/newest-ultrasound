@@ -1,0 +1,7 @@
+# Recommended Preliminary Model Noise Terms
+
+| Feature | Local noise median | Local noise p95 | ROI-mean sigma | ROI-mean range | Unit |
+| --- | --- | --- | --- | --- | --- |
+| Amplitude | 0.02098 | 0.1254 | 0.007961 | 0.02235 | V |
+| ToF | 0.01288 | 0.03276 | 0.02756 | 0.07688 | us |
+| Energy | 1.559 | 7.754 | 0.3411 | 0.951 | a.u. |

@@ -1,0 +1,11 @@
+{
+  "amp_max_in_ROI_mV": 2166.01611328125,
+  "amp_p99_in_ROI_mV": 1864.6401989746091,
+  "amp_pixels_at_5000mV": 0,
+  "amp_saturated_in_ROI": false,
+  "tof_min_in_ROI_us": 7.445568359375,
+  "tof_max_in_ROI_us": 9.685251953125,
+  "tof_median_in_ROI_us": 9.342947265625,
+  "T20%_minus_TOthers_mC": 48.917279850272166,
+  "T20%_slightly_higher": true
+}

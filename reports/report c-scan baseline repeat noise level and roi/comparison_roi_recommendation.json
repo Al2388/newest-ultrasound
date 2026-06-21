@@ -1,0 +1,98 @@
+{
+  "baseline_scan_id": "scan_2026-05-28_18-52-24",
+  "scan_shape": {
+    "rows": 144,
+    "cols": 500,
+    "roi_w_mm": 80.0,
+    "roi_h_mm": 72.0
+  },
+  "default_recommendation": "balanced_core_roi plus balanced_stable_mask for pixel-level analyses",
+  "balanced_core_roi": {
+    "name": "balanced_core_roi",
+    "row_start": 12,
+    "row_end": 132,
+    "col_start": 35,
+    "col_end": 465,
+    "thresholds": {
+      "amplitude_span_v": 0.55,
+      "tof_span_us": 0.18,
+      "energy_span": 32.0
+    },
+    "n_rows": 120,
+    "n_cols": 430,
+    "area_fraction": 0.7166666666666667,
+    "x_mm_min": 5.61122244488978,
+    "x_mm_max": 74.38877755511022,
+    "y_mm_min": 6.041958041958042,
+    "y_mm_max": 65.95804195804196,
+    "stable_pixel_fraction_within_roi": 0.7689147286821706,
+    "stable_pixel_fraction_total": 0.5510555555555555,
+    "metrics": {
+      "amplitude": {
+        "median_span": 0.08003115653991699,
+        "p95_span": 1.7641584277153,
+        "p99_span": 3.7570156884193446,
+        "max_span": 4.962832450866699
+      },
+      "tof": {
+        "median_span": 0.037901878356933594,
+        "p95_span": 0.6571822643280018,
+        "p99_span": 2.5411455535888683,
+        "max_span": 5.648186683654785
+      },
+      "energy": {
+        "median_span": 5.668895721435547,
+        "p95_span": 97.00529022216779,
+        "p99_span": 173.9896665954591,
+        "max_span": 294.68243408203125
+      }
+    }
+  },
+  "strict_core_roi": {
+    "name": "strict_core_roi",
+    "row_start": 15,
+    "row_end": 129,
+    "col_start": 50,
+    "col_end": 450,
+    "thresholds": {
+      "amplitude_span_v": 0.38,
+      "tof_span_us": 0.12,
+      "energy_span": 25.0
+    },
+    "n_rows": 114,
+    "n_cols": 400,
+    "area_fraction": 0.6333333333333333,
+    "x_mm_min": 8.016032064128256,
+    "x_mm_max": 71.98396793587175,
+    "y_mm_min": 7.5524475524475525,
+    "y_mm_max": 64.44755244755245,
+    "stable_pixel_fraction_within_roi": 0.7837719298245615,
+    "stable_pixel_fraction_total": 0.4963888888888889,
+    "metrics": {
+      "amplitude": {
+        "median_span": 0.06812667846679688,
+        "p95_span": 1.4137647271156306,
+        "p99_span": 2.918147602081299,
+        "max_span": 4.843955039978027
+      },
+      "tof": {
+        "median_span": 0.035305023193359375,
+        "p95_span": 0.46441626548767084,
+        "p99_span": 1.7041155147552491,
+        "max_span": 5.648186683654785
+      },
+      "energy": {
+        "median_span": 4.948951721191406,
+        "p95_span": 83.99040679931625,
+        "p99_span": 150.06924682617188,
+        "max_span": 282.8360595703125
+      }
+    }
+  },
+  "files": {
+    "masks_npz": "comparison_roi_masks.npz",
+    "overlay_png": "comparison_roi_overlay.png",
+    "noise_score_png": "comparison_roi_noise_score.png",
+    "stable_mask_png": "comparison_roi_stable_mask.png"
+  }
+}

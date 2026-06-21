@@ -73,7 +73,7 @@ import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Security
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -81,10 +81,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 import uvicorn
+from dotenv import load_dotenv
 
 from ultrasound_battery.services.scanner import CScanService
 from ultrasound_battery.services.ascan import AScanService
 from ultrasound_battery.services.gauging import GaugingService
+from ultrasound_battery.services.tc08 import TC08Service
+from ultrasound_battery.services.camera import CameraService
 
 
 # =============================================================================
@@ -94,6 +97,7 @@ from ultrasound_battery.services.gauging import GaugingService
 # Prefer an explicit API_KEY from .env (or the shell environment).
 # If absent, generate a fresh random key — printed once at startup so the
 # operator can use the dashboard immediately without any configuration.
+load_dotenv()
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     API_KEY = secrets.token_urlsafe(16)
@@ -139,6 +143,18 @@ def _latest_matching_file(base_dir: str, pattern: str) -> str | None:
     return max(files, key=os.path.getmtime) if files else None
 
 
+def _ensure_temperature_logging(mode: str, name: str = "") -> dict:
+    """
+    Start the TC-08 logger on demand so acoustic acquisitions always have a
+    temperature timebase when the hardware/driver is available.
+    """
+    if temp.running:
+        return {"started": False, "msg": "Temperature logger already running"}
+    session_name = "_".join(part for part in [mode, name.strip()] if part)
+    success, msg = temp.start({"session_name": session_name})
+    return {"started": success, "msg": msg}
+
+
 # =============================================================================
 # Request / response models  (Pydantic v2)
 # =============================================================================
@@ -149,12 +165,17 @@ class ScanConfig(BaseModel):
                                   description="Label included in the scan folder")
     roi_w:          float = Field(80.0, gt=0, le=500,
                                   description="Scan region width (mm)")
-    roi_h:          float = Field(70.0, gt=0, le=500,
+    roi_h:          float = Field(72.0, gt=0, le=500,
                                   description="Scan region height (mm)")
-    pitch:          float = Field(0.1,  gt=0, le=10,
+    pitch:          float = Field(0.5,  gt=0, le=10,
                                   description="Spacing between scan lines (mm)")
-    speed:          float = Field(10.0, gt=0, le=200,
+    speed:          float = Field(25.0, gt=0, le=200,
                                   description="Transducer scan speed (mm/s)")
+    accel_mode:     Literal["auto", "manual"] = Field(
+                                  "auto",
+                                  description="Choose printer acceleration automatically from scan speed, or use accel_mm_s2")
+    accel_mm_s2:    float = Field(800.0, gt=0, le=10000,
+                                  description="Manual printer acceleration (mm/s^2), used when accel_mode='manual'")
     cols:           int   = Field(500,  gt=0, le=5000,
                                   description="Output image width in pixels")
     cmap:           str   = "turbo"    # matplotlib colormap name for PNG exports
@@ -222,14 +243,28 @@ class GaugeConfig(BaseModel):
                                  description="CH1 voltage range (V)")
 
 
+class TemperatureConfig(BaseModel):
+    """Configuration for the USB TC-08 temperature logger."""
+    session_name: str = Field("",
+                              description="Label included in the temperature log folder")
+    interval_s: float = Field(0.1, ge=0.1, le=60.0,
+                              description="Seconds between TC-08 samples")
+    channels: list[int] = Field(default_factory=lambda: [1],
+                                description="Enabled TC-08 channels, 1-8")
+    thermocouple_type: str = Field("T",
+                                   description="Thermocouple type letter, e.g. K or T")
+
+
 # =============================================================================
 # Application setup
 # =============================================================================
 
 app     = FastAPI(title="Ultrasound Battery Lab", version="2.6")
-scanner = CScanService()
+temp    = TC08Service()
+scanner = CScanService(temperature_service=temp)
 ascan   = AScanService(cloud=scanner.cloud)   # share the CloudManager instance
 gauge   = GaugingService(cloud=scanner.cloud) # HS5-only; HDF5 archival to data/raw/gauging/
+camera  = CameraService(device_index=1, width=640, height=480, fps=10.0)
 
 # Templates live next to this file inside the package so the dashboard works
 # regardless of the current working directory when uvicorn is launched.
@@ -275,8 +310,9 @@ async def start_scan(cfg: ScanConfig):
     Requires: valid API key + neither C-scan nor A-scan already running.
     The scan runs asynchronously in a worker thread; poll /api/status for progress.
     """
+    temp_msg = _ensure_temperature_logging("cscan", cfg.scan_name)
     success, msg = scanner.start_scan(cfg.model_dump())
-    return {"success": success, "msg": msg}
+    return {"success": success, "msg": msg, "temperature": temp_msg}
 
 
 @app.post("/api/stop", dependencies=[Depends(_require_key)])
@@ -349,6 +385,77 @@ async def get_latest_meta():
 
 
 # =============================================================================
+# Temperature endpoints (USB TC-08)
+# =============================================================================
+
+@app.post("/api/temp/start", dependencies=[Depends(_require_key)])
+async def temp_start(cfg: TemperatureConfig):
+    """Start the USB TC-08 logger. It can run alongside C-scan/A-scan/gauging."""
+    success, msg = temp.start(cfg.model_dump())
+    return {"success": success, "msg": msg}
+
+
+@app.post("/api/temp/stop", dependencies=[Depends(_require_key)])
+async def temp_stop():
+    """Stop the USB TC-08 logger."""
+    success, msg = temp.stop()
+    return {"success": success, "msg": msg}
+
+
+@app.get("/api/temp/status")
+async def temp_status():
+    """Current TC-08 temperature logger status and latest sample."""
+    return temp.get_status()
+
+
+# =============================================================================
+# Camera endpoints (USB webcam live view)
+# =============================================================================
+
+@app.get("/api/camera/status")
+async def camera_status():
+    """Current capture-worker status, frame age, subscriber count."""
+    return camera.get_status()
+
+
+@app.get("/api/camera/snapshot")
+async def camera_snapshot():
+    """One JPEG frame. Cold-starts the camera if needed."""
+    jpeg = camera.snapshot()
+    if not jpeg:
+        raise HTTPException(status_code=503, detail="Camera unavailable")
+    return Response(content=jpeg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/camera/stream")
+async def camera_stream():
+    """MJPEG multipart stream. Use as <img src="/api/camera/stream">."""
+    boundary = "frame"
+
+    def gen():
+        camera.subscribe()
+        last_idx = -1
+        try:
+            while True:
+                jpeg, last_idx = camera.get_frame(last_index=last_idx, timeout_s=2.0)
+                if not jpeg:
+                    continue
+                yield (b"--" + boundary.encode() + b"\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                       + jpeg + b"\r\n")
+        finally:
+            camera.unsubscribe()
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# =============================================================================
 # A-scan endpoints
 # =============================================================================
 
@@ -360,8 +467,9 @@ async def ascan_start(cfg: AScanConfig):
     Requires: valid API key + neither C-scan nor A-scan already running.
     The session runs asynchronously; poll /api/ascan/status for live data.
     """
+    temp_msg = _ensure_temperature_logging("ascan", cfg.session_name)
     success, msg = ascan.start_session(cfg.model_dump())
-    return {"success": success, "msg": msg}
+    return {"success": success, "msg": msg, "temperature": temp_msg}
 
 
 @app.post("/api/ascan/stop", dependencies=[Depends(_require_key)])

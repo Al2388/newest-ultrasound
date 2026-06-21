@@ -56,7 +56,8 @@ class PrecisionEnder:
     """
 
     def __init__(self, port: str, baud: int = 115200,
-                 reset_time: float = 2.0, reset_origin: bool = True):
+                 reset_time: float = 2.0, reset_origin: bool = True,
+                 accel_mm_s2: float = 500.0, jerk_mm_s: float = 5.0):
         self.ser = serial.Serial(port, baud, timeout=1.0)
         time.sleep(reset_time)              # wait for Marlin MCU reset to complete
         self.ser.reset_input_buffer()
@@ -73,6 +74,8 @@ class PrecisionEnder:
         # Motion parameters — override these before calling start_scan if needed
         self.scan_speed_mm_s      = 10.0
         self.scan_feedrate        = int(self.scan_speed_mm_s * 60)   # G1 F in mm/min
+        self.accel_mm_s2          = float(accel_mm_s2)
+        self.jerk_mm_s            = float(jerk_mm_s)
         self.positioning_feedrate = 1800    # mm/min for rapid between-line moves
         self.line_spacing_mm      = 0.1
 
@@ -202,6 +205,9 @@ class PrecisionEnder:
             "M203 X500 Y500 E50",        # max velocity (mm/s)
             "M204 P500 R500 T500",       # acceleration (mm/s²): print / retract / travel
             "M205 X5.0 Y5.0 E5.0",       # junction deviation / jerk (mm/s)
+            f"M201 X{self.accel_mm_s2:.3f} Y{self.accel_mm_s2:.3f}",
+            f"M204 P{self.accel_mm_s2:.3f} R{self.accel_mm_s2:.3f} T{self.accel_mm_s2:.3f}",
+            f"M205 X{self.jerk_mm_s:.3f} Y{self.jerk_mm_s:.3f} E5.0",
         ]
 
         # G92 redefines the current XY position as the coordinate origin.
@@ -275,7 +281,9 @@ class PrecisionEnder:
 def setup_precision_printer(port: str, baud: int,
                              roi_w: float, roi_h: float,
                              safety_margin: float = 2.0,
-                             reset_origin: bool = True
+                             reset_origin: bool = True,
+                             accel_mm_s2: float = 500.0,
+                             jerk_mm_s: float = 5.0
                              ) -> tuple:
     """
     Open the printer and compute the safe scan boundary coordinates.
@@ -299,7 +307,10 @@ def setup_precision_printer(port: str, baud: int,
         y_start  — top-most safe Y coordinate (mm)  [first scan line]
         y_end    — bottom-most safe Y coordinate (mm) [last scan line]
     """
-    pr      = PrecisionEnder(port, baud, reset_origin=reset_origin)
+    pr      = PrecisionEnder(
+        port, baud, reset_origin=reset_origin,
+        accel_mm_s2=accel_mm_s2, jerk_mm_s=jerk_mm_s,
+    )
     x_left  = safety_margin
     x_right = roi_w - safety_margin
     y_start = safety_margin
